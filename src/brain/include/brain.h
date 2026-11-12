@@ -1,0 +1,392 @@
+#pragma once
+
+#include <string>
+#include <rclcpp/rclcpp.hpp>
+#include <opencv2/opencv.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <sensor_msgs/msg/joy.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
+#include <geometry_msgs/msg/pose2_d.hpp>
+#include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <vision_interface/msg/detections.hpp>
+#include <vision_interface/msg/line_segments.hpp>
+#include <vision_interface/msg/cal_param.hpp>
+#include <vision_interface/msg/segmentation_result.hpp>
+#include <game_controller_interface/msg/game_control_data.hpp>
+#include "brain/msg/kick.hpp"
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+// 必须先于 RoboCupGameControlData.h 引入：该头文件定义了 STATE_READY 等宏，
+// 会与 robot_interfaces/msg/RobotState.msg 的 STATE_* 常量同名而展开成非法代码。
+// robot_client.h -> robot_io/zl_io.h 会引入 zl 消息头，故提前到这里。
+#include "robot_client.h"
+
+#include "RoboCupGameControlData.h"
+#include "team_communication_msg.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <stdexcept>
+
+#include "brain_config.h"
+#include "brain_data.h"
+#include "brain_log.h"
+#include "brain_tree.h"
+#include "brain_communication.h"
+#include "locator.h"
+#include "visualization_publisher.h"
+
+using namespace std;
+
+/**
+ * Core `Brain` class. As shared pointers are passed to `BrainTree`, this class
+ * must support shared_from_this semantics.
+ * Data is encapsulated in sub-objects rather than stored directly in `Brain`.
+ * Static configuration values live in `config`; dynamic runtime data lives in `data`.
+ * TODO: Some data is also stored in the BehaviorTree blackboard; consider removing duplicates.
+ * Current design passes the `brain` pointer into BehaviorTree nodes which directly access `brain->config` and `brain->data`.
+ */
+class Brain : public rclcpp::Node
+{
+public:
+    // 球位“新鲜”阈值（ms）：本帧无检测、或距最后一次检测超过该时长，位置即视为过期。
+    // publishBallPosition / CamTrackBall / Kick 等消费端统一用它判断，避免各节点
+    // 各自依赖 ball_location_known（2 s 记忆）或干脆不判，导致过期球位继续驱动动作与上报。
+    static constexpr double kBallFreshMs = 300.0;
+
+    // BrainConfig object, mainly contains configuration values needed at runtime (static)
+    std::shared_ptr<BrainConfig> config;
+    // BrainLog object, encapsulates log-related operations
+    std::shared_ptr<BrainLog> log;
+    // BrainData object, all runtime values of Brain are stored here
+    std::shared_ptr<BrainData> data;
+    // RobotClient object, contains all operations related to the robot
+    std::shared_ptr<RobotClient> client;
+    // Locator object, contains robot localization related operations
+    std::shared_ptr<Locator> locator;
+    // VisualizationPublisher object, used to publish visualization markers
+    std::shared_ptr<VisualizationPublisher> visualizer;
+    // BrainTree object, contains BehaviorTree related operations
+    std::shared_ptr<BrainTree> tree;
+    // Communication object, contains communication related operations, mainly for dual-machine communication and referee communication
+    std::shared_ptr<BrainCommunication> communication;
+
+    // Constructor: create ROS2 node (nodeName handled in implementation)
+    Brain();
+
+    ~Brain();
+
+    // Initialize operations, only need to be called once in the main function. If the initialization process does not meet expectations, an exception can be thrown to terminate the program.
+    void init();
+
+    // Called in the ROS2 loop
+    void tick();
+
+    // Handle special states, such as kickoff, free kick, etc.
+    void handleSpecialStates();
+
+    void registerLocatorNodes(BT::BehaviorTreeFactory &factory)
+    {
+        RegisterLocatorNodes(factory, this);
+    }
+
+    /**
+     * @brief Calculate the vector angles from the current ball position to the opponent's goalposts, in the field coordinate system
+     *
+     * @param  margin double, when calculating the angles, the returned values are moved inward from the actual goal positions by this distance, because the ball will be blocked by the goalposts at this angle. The larger this value, the higher the shooting accuracy, but the longer it takes to adjust the angle.
+     *
+     * @return vector<double> The returned vector contains vec[0] as the left goalpost and vec[1] as the right goalpost. Note that left and right are based on the opponent's direction as the front.
+     */
+    vector<double> getGoalPostAngles(const double margin = 0.3);
+
+    double calcKickDir(double goalPostMargin = 0.3);
+
+    // type: kick: dribble, shoot: rl kick
+    bool isAngleGood(double goalPostMargin = 0.3, string type = "kick");
+
+   
+    bool isBallOut(double locCompareDist = 3.0, double lineCompareDist = 1.0);
+
+    
+    void updateBallOut();
+
+    
+    double distToBorder();
+
+    bool isDefensing();
+
+    bool isBoundingBoxInCenter(BoundingBox boundingBox, double xRatio = 0.8, double yRatio = 0.8);
+
+    void calibrateOdom(double x, double y, double theta);
+
+    double msecsSince(rclcpp::Time time);
+
+    bool isFreekickStartPlacing();
+
+    rclcpp::Time timePointFromHeader(std_msgs::msg::Header header);
+
+
+    void updateCostToKick();
+
+    /**
+     * @brief Publish visualization markers (robot position, ball position, field lines, mark points)
+     */
+    void publishVisualizationMarkers();
+
+    /**
+     * @brief Publish odom to map TF transform
+     */
+    void publishOdomToMapTF();
+
+    /**
+     * @brief Publish field dimensions as static messages
+     */
+    void publishFieldDimensions();
+
+    /**
+     * @brief Publish robot position (field coordinate system)
+     */
+    void publishRobotPose();
+
+    /**
+     * @brief Publish ball position (field coordinate system)
+     */
+    void publishBallPosition();
+
+    /**
+     * @brief Publish teammates' positions (field coordinate system)
+     */
+    void publishTeammatesPoses();
+
+    void pubKickMsg();
+
+    /**
+     * @brief Publish the behavior-tree strategy chain executed this tick, as a JSON string.
+     *        Used by sim_console to show which strategy branch is active (UI telemetry only).
+     */
+    void publishBrainStrategy();
+
+    // ------------------------------------------------------ SUB CALLBACKS ------------------------------------------------------
+
+    void gameControlCallback(const game_controller_interface::msg::GameControlData &msg);
+
+    void detectionsCallback(const vision_interface::msg::Detections &msg);
+
+    void fieldLineCallback(const vision_interface::msg::LineSegments &msg);
+
+    void imageCameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
+
+    void depthCameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
+
+    void depthImageCallback(const sensor_msgs::msg::Image::ConstSharedPtr &msg);
+
+    void compressedDepthImageCallback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
+
+    void processDepthImage(const cv::Mat &depthFloat, int width, int height, const std_msgs::msg::Header &header);
+
+    // /robot/head_to_base 自 2026-11-11 起为 geometry_msgs/PoseStamped（zl 侧新增 header.stamp，frame_id 留空）。
+    void headPoseCallback(const geometry_msgs::msg::PoseStamped &msg);
+
+    /**
+     * Ground truth bypass callbacks (mocap/simulation localization injection)
+     */
+    void gtPoseCallback(const geometry_msgs::msg::Pose2D &msg);
+
+    void gtBallCallback(const geometry_msgs::msg::Point &msg);
+
+    void updateRelativePos(GameObject &obj);
+
+    void updateFieldPos(GameObject &obj);
+
+    /**
+     * @brief Calculate the collision distance
+     * 
+     * @param angle double, target angle
+     * 
+     * @return double, collision distance
+     */
+    double distToObstacle(double angle);
+
+    vector<double> findSafeDirections(double startAngle, double safeDist, double step=deg2rad(10));
+
+    double calcAvoidDir(double startAngle, double safeDist);
+
+    /**
+     * @brief calcAvoidDir 的“盲区安全”版本：把偏转夹到 ±maxOffsetRad 内。
+     *
+     * calcAvoidDir 依赖 distToObstacle 判“安全方向”，而栅格只覆盖相机 FOV
+     * （水平半角约 40°）以内；FOV 外的方向一律返回 1e9，会被误判为安全。
+     * 直接采用会得到指向盲区的绕行角。
+     *
+     * @param startAngle double, 期望朝向（robot 系）
+     * @param safeDist double, 安全距离（必须小于栅格量程 max_x）
+     * @param maxOffsetRad double, 允许的最大偏转（弧度）
+     * @param outDir double&, 限幅后的绕行角
+     * @return bool, false = 限幅后该方向仍近距受阻，调用方应减速直行而非转向
+     */
+    bool calcSafeAvoidDir(double startAngle, double safeDist, double maxOffsetRad, double &outDir);
+
+    /**
+     * @brief 队友贴身让位速度：最近的存活队友距离小于 rSep 时，输出沿背离该队友方向
+     *        低速退开的速度（robot 坐标系）。调用方应直接下发该速度并跳过本周期的到位
+     *        判定，避免与队友互相顶住形成僵持（门线防守等队友拥有优先权）。
+     *        触发条件留有余量（默认 0.7 m），须大于模拟器的物理分离距离 0.6 m。
+     *
+     * @param vx vy vtheta double&, 退让速度输出（robot 坐标系；vtheta 保持面向球）
+     * @param rSep double, 触发距离（默认 0.7）
+     * @param speed double, 退让线速度（默认 0.3，即 setVelocity 的最小速度下限）
+     *
+     * @return bool, true=输出有效退让速度
+     */
+    bool calcTeammateSeparationVelocity(double &vx, double &vy, double &vtheta, double rSep = 0.7, double speed = 0.3);
+
+    /**
+     * @brief 追球/绕球阶段（Chase、Adjust）的单侧队友让位。
+     *
+     * 与 calcTeammateSeparationVelocity 的区别：本函数先用 (cost, player_id) 仲裁决定
+     * 「该不该由我退」，只有明显更差（或同档且 id 更大）的一台才输出退让速度，因此
+     * 同一时刻只有一台在退，不会出现两台互相退开的活锁。球已进入踢球距离时不让位，
+     * 避免把正在起脚的一台拽离球。最近队友是门将时无条件让位（门将拥有优先权）。
+     *
+     * @param vx vy vtheta double&, 退让速度输出（robot 坐标系）
+     * @param minBallRange double, 球距小于该值时不触发让位（Chase 用 0.8，Adjust 用 0.55）
+     * @return bool, true=输出有效退让速度
+     */
+    bool calcChaseYieldVelocity(double &vx, double &vy, double &vtheta, double minBallRange = 0.8);
+
+
+    /**
+     * agent related
+     */
+    void agentCommandCallback(const std_msgs::msg::String::SharedPtr msg);
+
+private:
+    void loadConfig();
+
+    void updateBallMemory();
+
+    void updateRobotMemory();
+
+    void updateObstacleMemory();
+
+    void updateKickoffMemory();
+
+    void updateMemory();
+
+    bool gtBallFresh();
+
+    void handleCooperation();
+
+    // ------------------------------------------------------ Vision Processing ------------------------------------------------------
+
+    int markCntOnFieldLine(const string MarkType, const FieldLine line, const double margin = 0.2);
+
+    int goalpostCntOnFieldLine(const FieldLine line, const double margin = 0.2);
+
+    bool isBallOnFieldLine(const FieldLine line, const double margin = 0.3); 
+
+    void identifyFieldLine(FieldLine &line);
+
+    void identifyMarking(GameObject& marking);
+
+    void identifyGoalpost(GameObject& goalpost);
+
+    void updateLinePosToField(FieldLine &line);
+
+    vector<FieldLine> processFieldLines(vector<FieldLine> &fieldLines);
+
+    vector<GameObject> getGameObjects(const vision_interface::msg::Detections &msg);
+    void detectProcessBalls(const vector<GameObject> &ballObjs);
+
+    void detectProcessMarkings(const vector<GameObject> &markingObjs);
+
+    void detectProcessRobots(const vector<GameObject> &robotObjs);
+
+    void detectProcessGoalposts(const vector<GameObject> &goalpostObjs);
+
+    void detectProcessVisionBox(const vision_interface::msg::Detections &msg);
+    
+    void logDepth(int grid_x_count, int grid_y_count, vector<vector<int>> &grid, vector<std::array<float, 3>> &points);
+
+    void logDebugInfo();
+
+
+    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joySubscription;
+    rclcpp::Subscription<game_controller_interface::msg::GameControlData>::SharedPtr gameControlSubscription;
+    rclcpp::Subscription<vision_interface::msg::Detections>::SharedPtr detectionsSubscription;
+    rclcpp::Subscription<vision_interface::msg::LineSegments>::SharedPtr subFieldLine;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr imageCameraInfoSubscription;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr depthCameraInfoSubscription;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depthImageSubscription;
+    rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr compressedDepthImageSubscription;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr headPoseSubscription;
+    rclcpp::Subscription<geometry_msgs::msg::Pose2D>::SharedPtr gtPoseSubscription;
+    rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr gtBallSubscription;
+    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubVisualizationMarkers;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubFieldDimensions;
+    rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr pubRobotPose;
+    rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr pubBallPosition;
+    rclcpp::Publisher<brain::msg::Kick>::SharedPtr pubKickBall;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubTeammatesPoses;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pubBrainStrategy;
+
+    // brain_strategy telemetry: last published body (change detection) and throttle/heartbeat clock
+    string lastStrategyBody;
+    rclcpp::Time lastStrategyPubTime;
+
+    // ------------------------------------------------------ debug logs related ------------------------------------------------------
+    void logLags();
+    // 1 Hz 障碍/深度链观测：obstacles 数量、最近距离、前向距离、深度断流时长
+    void logObstacleStatus();
+    void logStatusToConsole();
+    string getComLogString(); 
+    std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+    // ------------------------------------------------------ ground truth localization bypass ------------------------------------------------------
+    // timestamp of the last received ground truth ball message (zero = never received)
+    rclcpp::Time lastGtBallTime;
+    // when the ground truth ball was declared lost after a timeout (zero = not lost)
+    rclcpp::Time gtBallLostTime;
+    // whether the current ball state originates from ground truth
+    bool gtBallActive = false;
+
+    // ------------------------------------------------------ cost smoothing & lead hysteresis ------------------------------------------------------
+    // cost 中值滤波：抑制丢球/摔倒等台阶项在单拍造成的突变，避免 lead 反复易手
+    static constexpr int COST_HISTORY_LEN = 5;
+    double costHistory[COST_HISTORY_LEN] = {0.};
+    int costHistoryIdx = 0;
+    int costHistoryFilled = 0;
+    // 摔倒惩罚斜坡计时（0→15 在 1.5 s 内爬升，替代原 0/15 台阶）
+    bool fallTimerActive = false;
+    rclcpp::Time fallStartTime;
+    // lead 切换迟滞：候选结论须连续保持 LEAD_SWITCH_HOLD_MS 才真正换手
+    bool leadSwitchPending = false;
+    bool leadSwitchTarget = true;
+    rclcpp::Time leadSwitchStartTime;
+
+    // ------------------------------------------------------ teammate ball sharing ------------------------------------------------------
+    // 球位置来源（本地检测 / 队友共享）与交接保护窗：来源切换后短时间内禁止触发踢球，
+    // 避免两套场系间 0.7~1.4 m 的位置跳变直接变成一脚乱踢。
+    bool ballPosFromTeammate = false;
+    rclcpp::Time ballPosHandoffTime;
+    // 贴身 hint（队友球位离我 <2 m 或队友自己也在用记忆）：300 ms 内有效，仅用于转头
+    rclcpp::Time lastTmBallHintTime;
+
+    // ------------------------------------------------------ agent related ------------------------------------------------------
+    // In agent mode, subscribe to parameter changes and handle callbacks
+    std::shared_ptr<rclcpp::ParameterEventHandler> param_subscriber_;
+    std::shared_ptr<rclcpp::ParameterCallbackHandle> team_id_handle_;
+    std::shared_ptr<rclcpp::ParameterCallbackHandle> player_role_handle_;
+};

@@ -1,0 +1,274 @@
+brain_node:
+  ros__parameters:
+    game:
+      team_id: 29 # must be consistent with GameControl
+      player_id: 1 # 1 | 2 | 3 | 4 | 5
+      field_type: "adult_size" # adult_size | kid_size | robo_league
+      player_role: "striker" # striker | goal_keeper
+      treat_person_as_robot: false
+      number_of_players: 3
+      
+    robot:
+      robot_name: "" # When multiple robots exist, specify e.g. "robot0", "robot1"; leave empty for single robot
+      robot_height: 0.8 # 1.12 for T1
+      odom_factor: 0.8 # 1.2 for T1
+      vx_factor: 0.50
+      yaw_offset: 0.0
+      # 注意：vx_factor 只折 crabWalk 路径的 vx（x/y 位移比标定补偿），与 speed_scale 语义不同，勿混用。
+      vx_limit: 1.0
+      vy_limit: 0.4
+      vtheta_limit: 1.2
+      # 2026-11-05：3588 侧取消速度映射缩减后，本体按下发值 1:1 执行（旧版本实际约折半）。
+      # 1.0 = 保持新真实速度；需要快速回退到旧手感时设为 0.5（等价旧映射），重启 brain 即生效。
+      # 只作用于 setVelocity 出口的“下发值→本体”一段，min_v* 与各 *limit 仍按本体侧单位解释。
+      speed_scale: 1.0
+      # 下限抬升原值 0.3/0.3/0.25 是按折半速度标定的；提速后同样的抬升相当于每拍位移/角位移翻倍，
+      # 近零误差时会变成持续横移+原地转（实测出现过 448 s 恒定 (-0.30, +0.30, +0.25)），故随速度系数一并折半。
+      min_vx: 0.15 # Minimum x velocity when command is too small, to prevent no response
+      min_vy: 0.15 # Minimum y velocity when command is too small, to prevent no response
+      min_vtheta: 0.12 # Minimum theta velocity when command is too small, to prevent no response
+      # 球方位→角速度的跟踪增益（SimpleChase / GoToGoalBlocking / Assist 原为硬编码 *4.0）。
+      # 2.0 ≈ 提速前的等效增益；|yaw| < deadband 直接归零，避免 min_vtheta 抬升把近零方位误差放大成持续原地转。
+      yaw_track_gain: 2.0
+      yaw_track_deadband: 0.08
+      # 2026-11-06：转向纯 P 在执行滞后（步态+板端平滑 100~200ms）叠加增益翻倍后形成极限环，
+      # 表现为球静止时机器人绕球来回摆（实测球位 157 帧不变、vx=vy=0 而 vtheta 反复换向）。
+      # damping 是 D 项增益，作用于 odom 实测角速度（非误差差分，目标跳变不会产生微分尖峰）：
+      #   vtheta = Kp*err - damping*omega，omega 涨到 Kp*err/damping 时输出归零，自动进入滑行段。
+      # <=0 时整条通道退化为原纯 P 行为，作为回退开关。
+      yaw_track_damping: 0.20
+      # odom yaw 差分得到的角速度低通截止频率（Hz）；步态引起抖动时降到 5，响应迟钝升到 12。
+      yaw_rate_lpf_hz: 8.0
+      cmd_log_interval_ms: 1000 # setVelocity 日志节流间隔(ms)：>0 节流，0 逐拍全量输出（专项排查），<0 关闭
+      # 头部限位（rad）。pitch 是「相机光轴下俯角」，由 zl_io.head_pitch_offset_deg=-36
+      # 换算成 head_pitch 关节角。新头部相机相对 head_pitch_link 固定下俯 36°、pitch 关节
+      # 限位 ±25°，因此光轴只能落在 11°~61° 下俯（0.20~1.06 rad），不存在平视状 态。
+      head_yaw_limit_left: 1.1
+      head_yaw_limit_right: -1.1
+      head_pitch_limit_up: 0.20 # 最抬头（下俯约 11.5°），再小会被机械限位夹住
+      head_pitch_limit_down: 1.06 # 最低头（下俯约 60.7°）
+    
+    # 2026-11-05 定位振荡取证（默认关闭）。
+    # >0 时按该频率打印 dbg/track：pose(场地图) / ballR(机器体系) / ballF(场地图) / range yaw det age / kickDir / decision。
+    # 用途：区分“目标（球位或位姿）本身在跳”与“执行层在摆”——单看 setVelocity_out 无法区分。
+    debug:
+      track_log_hz: 0.0
+
+    # zl_robot 原生 I/O（RobotClient 直接收发；2026-11-03 起取代 brain_zl_bridge 进程）。
+    # 话题全部为 zl 契约原名，不带机器人名前缀/后缀（实机一机一图）。
+    zl_io:
+      # 头部：brain 下发相机光轴语义（弧度），zl external_node 期望关节角（度）。
+      # 反馈侧按同一偏置反向换算，两者必须成对，否则增量闭环会把安装角当误差。
+      head_yaw_sign: 1.0
+      head_pitch_sign: 1.0
+      head_yaw_offset_deg: 0.0
+      head_pitch_offset_deg: -36.0
+      fb_head_yaw_sign: 1.0
+      fb_head_pitch_sign: 1.0
+      # 意图（RobotIntent）身份：api 区间 50~99，取 50 与板侧 board_ctl.sh prep 同极
+      # （router 只在 candidate > active 时拒绝，同值可通过）。
+      intent_source: "api"
+      intent_priority: 50
+      intent_interval_sec: 0.8 # 状态机意图重发间隔（s）
+      # 踢球交接（config/mode + model/switch_model）跟随板侧 router 当前会话的
+      # source/priority；显式配置了 switch_model_intent_source/priority 时以显式值为准。
+      auto_match_intent_priority: true
+      switch_model_intent_source: ""
+      switch_model_intent_priority: -1
+      # 话题命名：单机用实机契约名；多机仿真由 launch 按 robot_name 注入
+      # topic_ns=/robot_0N、cmd_vel_topic=/robot_0N/cmd_vel。
+      topic_ns: "/robot"
+      cmd_vel_topic: "/cmd_vel"
+      # 默认保留本体原来源。旁路验收后才将 odom_topic 设为 /autoodom/selected，
+      # 同时设 odom_convention=consistent；新来源独立尺度默认为 1。
+      odom_convention: "legacy_world_position"
+      consistent_odom_scale: 1.0
+      kick_model_name: "t4_kicking"
+      kick_rl_timeout_sec: 8.0 # 切 RL 后最长等待回合结束（s）
+      restore_mix_attempts: 1 # 回切 MIX 的重发次数（router 无回执，>1 仅刷日志）
+      restore_mix_interval_sec: 0.8
+      # 踢球 motion ended 后的速度抑制窗（s，0=关闭）。
+      # 依据 2026-11-09 39 号机：击球瞬间本体仍在侧倾，motion ended 后 0.4 s 就发 vx=0.67
+      # 会把机身压翻（切回后 1 s 内侧倾 17°→81°）。窗内一律发零速并刷 zl_io/suppress 日志。
+      kick_settle_suppress_sec: 0.8
+
+      # ---- 真实球门位姿合成（原 goal_pose_synth 独立节点，2026-11-03 并入）----
+      # 门心与门外法线在 Brain 场地系（+x 指向对方球门）是常量，只要有机器人位姿就能算基座系门位姿。
+      # 输出默认用域100 的 /soccer/goal_*_robot，由板侧 domain_bridge remap 成 zl 契约名；
+      # 六机自包含形态（无 domain_bridge）可改指向 /robot/perception/target_*。
+      kick_targets_enable: true # 运行期可 ros2 param set /brain_node zl_io.kick_targets_enable false
+      goal_line_x: 7.0 # 门线（场地系 x，adult_size 为 7.0）
+      goal_line_y: 0.0
+      kick_targets_attack_sign: 1.0 # +1=进攻 +x 门；-1=镜像场地
+      goal_z: -0.68 # 门心相对基座高度差（消费端只取 xy）
+      kick_targets_publish_hz: 50.0
+      kick_targets_pose_timeout_sec: 0.3 # 位姿过期即停发（零阶保持上一帧）
+      kick_targets_nav_timeout_sec: 0.3
+      kick_targets_field_bound_x: 8.0 # 越界视为无效位姿
+      kick_targets_field_bound_y: 5.0
+      kick_targets_stable_required_sec: 1.0 # 连续有效多久才发
+      kick_targets_jump_reset_m: 1.0 # 重定位跳变阈值
+      kick_targets_jump_reset_rad: 0.5
+      kick_targets_use_nav_tilt: true # 用 IMU roll/pitch 组基座系；false=yaw-only
+      kick_targets_max_tilt_deg: 25.0 # 倾角超限退化 yaw-only
+      goal_dest_topic: "/soccer/goal_destination_robot"
+      goal_normal_topic: "/soccer/goal_normal_robot"
+
+      # ---- 球检测类型转换（原 ball_type_adapter 节点，2026-11-03 并入）----
+      # vision_interface/Ball -> robot_interfaces/Ball，给 zl rl_manager 的踢球观测用。
+      ball_fwd_enable: true
+      ball_in_topic: "/soccer/ball"
+      ball_out_topic: "/soccer/ball_robot"
+
+    strategy:
+      ball_confidence_threshold: 50.0
+      # 球位记忆时长（s）：超过即 ball_location_known=false，决策转入找球。
+      # 2026-10-28：2.0 → 0.5（避免踢球后“以为球还在脚下”）。
+      # 2026-10-30：0.5 → 1.2。CamTrackBall 的“丢球后继续朝最后方向转头”宽限期
+      # 受该值门控：known=false 时行为树直接切 CamFindBall，宽限期再长也用不上。
+      # “以为球在脚下”的主要危害已由另两道门控堵住：上报/踢球用 kBallFreshMs=300ms，
+      # CamTrackBall 近距球（<0.6m）300ms 内就停止压头。
+      ball_memory_timeout: 1.2
+      tm_ball_dist_threshold: 2.0
+      # 队友球位共享（2026-11-10 P0）：
+      #   tm_ball_lag_max_ms    队友包新鲜度上限（超过不采信）
+      #   tm_ball_conflict_dist 本机检测与队友球位的冲突门限（超过以本机为准）
+      #   tm_ball_hint_peer_sep 贴身 hint 要求的最近队友距离
+      #   ball_src_guard_ms     球位来源 LOCAL/TM 切换后的禁踢保护窗
+      tm_ball_lag_max_ms: 300.0
+      tm_ball_conflict_dist: 1.0
+      tm_ball_hint_peer_sep: 1.5
+      ball_src_guard_ms: 150.0
+      limit_near_ball_speed: false
+      near_ball_speed_limit: 0.2
+      near_ball_range: 3.0
+      abort_kick_when_ball_moved: true
+      ball_out_threshold: 2.0
+      cooperation:
+        enable_role_switch: false
+        ball_control_cost_threshold: 20.0
+
+    obstacle_avoidance:
+      # 采样步长：16 -> 8（2026-10-27 实测）。3 m 处人体在 step=8 下每格约 15 点，
+      # step=16 时只剩 1/4，容易低于 occupancy_threshold 而被整格滤掉
+      # （实测 n=4 但 fwd=1e9 的成因之一）。4800 点/帧 @30Hz 开销仍可忽略。
+      depth_sample_step: 8
+      obstacle_min_height: 0.45
+      # 基座原点 -> 地面（odom 原点）的 +z 偏置，必须与 zl 侧 head_pose 的 base_height 一致。
+      # 深度点云转到 base 系、以及 obstacle_min_height 的基准都依赖它。
+      base_height_m: 0.83
+      grid_size: 0.2
+      max_x: 3.0
+      max_y: 5.0
+      exclusion_x: 0.4
+      exclusion_y: 0.5
+      ball_exclusion_radius: 0.0
+      ball_exclusion_height: 0.3
+      # 绝对点数阈值：单帧落入一格(0.2m)的采样点数（640x480/step16 时 2m 处约 9~10 点、
+      # 3m 处约 4 点）。噪声大上调到 8，但不要超过 10，否则 3m 处全部漏检。
+      # 注意它与球的 0-100 检测置信度不是同一量纲（球入库时会被抬到阈值之上）。
+      occupancy_threshold: 5.0
+      # 射线走廊半宽：两机半径和约 0.4 m + 5 cm 余量。0.3 时会在 1.3 m 处漏判“擦身”
+      collision_threshold: 0.45
+      safe_distance: 2.0
+      avoid_secs: 3.0
+      enable_freekick_avoid: false
+      freekick_start_placing_safe_distance: 0.1
+      freekick_start_placing_avoid_secs: 2.5
+      obstacle_memory_msecs: 500.0
+      avoid_during_kick: false
+      kick_ao_safe_dist: 3.0
+      # S2（2026-10-27 开启）：深度栅格已实测可用（人站正前 1.3 m 时 fwd=1.30、maxconf≈139，
+      # 与 depth_probe.py --grid 同帧误差 <0.01 m）。
+      # chase_ao_safe_dist 必须小于 max_x(3.0)，否则 findSafeDirections 在任何方向都找不到
+      # “安全方向”（栅格最大量程 3.0），calcAvoidDir 恒返回 0，绕行会退化成直行；1.8 留 1.2 m 余量。
+      avoid_during_chase: true
+      chase_ao_safe_dist: 1.8
+      # 绕行角上限（度）：栅格只覆盖相机 FOV（水平半角约 40°）。实测 0.5 m 宽的人站在 1.3 m 处，
+      # 需要 ±30~35° 才能绕开；取 30 会频繁退化为“停车/减速”，故取 35（仍留 ~5° 盲区余量）。
+      avoid_max_offset_deg: 35.0
+      # 贴身区（m）：障碍近于此距离时不再做小角度绕行，直接停车。
+      # 原因：distToObstacle 是“走廊有没有东西”而非距离场，小角度偏转会把障碍推出
+      # collision_threshold 后返回 1e9，回查会把 0.62 m 的障碍误判成“已绕开”（实测 dir 塌缩到 -2.9°）。
+      avoid_min_clearance_m: 0.8
+      # 每帧发布深度点云 + 障碍栅格可视化（30 Hz 重操作），仅排查时开
+      publish_pointcloud: false
+
+    RLVisionKick:
+      enableAutoVisualKick: true
+      autoVisualKickEnableDistMin: 0.2
+      autoVisualKickEnableDistMax: 4.0
+      autoVisualKickEnableAngle: 0.8
+
+    locator:
+      min_marker_count: 2
+      max_residual: 0.35
+      # 实验开关默认关闭，粒子数与航向半宽保留 Brain 原默认。
+      num_particles: 200
+      trust_yaw_half_width_deg: 1.0
+      # 几何与 trust_direction 拆分调度
+      split_schedule: true
+      split_retry_ms: 500.0
+      split_min_drift_m: 0.2
+      split_max_drift_m: 2.0
+      split_unbounded: false
+      max_drift_speed: 0.1
+      # 启用实验性 1M 多候选及歧义拒绝
+      one_m_multi_candidate: false
+      one_m_candidate_diagnostics: false
+      one_m_score_margin: 0.02
+      one_m_ambiguity_separation_m: 0.2
+      # 记录 TRUSTDIR 结果/搜索框和周期性调度次数
+      diagnostics: true
+      # 轨迹与定位成功事件诊断，默认关闭。
+      trace_enabled: true
+      trace_interval_sec: 0.1
+
+    enable_com: true
+
+    # 队内通信画像（2026-11-11 从 config_local.yaml 回收到基线）。
+    # 原先只在 config_local.yaml 里写该键、config.yaml 完全没有，结果是某台机漏同步
+    # config_local 时会静默回落代码默认 false，多机通信退化成单实例且无任何报错。
+    #   multi_instance=true ：队友表按 playerId 建键、每人独立单播端口
+    #   （30000+teamId+playerId）；单机同跑多台 brain 必须，真机分机部署同样兼容
+    #   （各绑自己端口），单台运行无副作用。单实例旧行为改为 false 即回退。
+    comm:
+      multi_instance: true
+
+    recovery:
+      retry_max_count: 2
+
+    ground_truth:
+      # Localization bypass for mocap/simulation setups (default off; when off, the
+      # vision + particle filter pipeline behaves exactly as before).
+      # When enabled, subscribes /soccer/ground_truth_pose|ball (forwarded by
+      # brain_zl_bridge): ground truth pose calibrates localization directly (particle
+      # filter short-circuited); ground truth ball overrides the vision ball until it
+      # stops publishing, then vision takes over again.
+      enable_pose: false
+      enable_ball: false
+      ball_timeout_sec: 1.0 # seconds without a ground truth ball before it is considered lost
+
+    vision:
+        # 相机话题/内参以 vision.yaml 的 camera.* 为准（实机单一来源）；
+        # 下面的值仅在 vision.yaml 缺失该类键时兜底。
+        image_camera_info_topic: "/camera/camera/color/camera_info" # RealSense
+        depth_image_topic: "/camera/camera/aligned_depth_to_color/image_raw" # RealSense aligned depth
+        depth_camera_info_topic: "/camera/camera/aligned_depth_to_color/camera_info" # RealSense
+        # 深度订阅 QoS：reliable | best_effort，必须与相机发布端一致
+        # （现场用 ros2 topic info -v 查看 publisher 的 Reliability），错配会静默收不到。
+        depth_qos: "reliable"
+
+        # image_camera_info_topic: "/StereoNetNode/rectified_image" # d-robotics（旧）
+        # depth_image_topic: "/StereoNetNode/stereonet_depth" # d-robotics（旧）
+        # depth_camera_info_topic: "/StereoNetNode/stereonet_depth/camera_info" # d-robotics（旧）
+
+        # image_camera_info_topic: "/zed/zed_node/left/camera_info" # zed
+        # depth_image_topic: "/zed/zed_node/depth/depth_registered" # zed
+        # depth_camera_info_topic: "/zed/zed_node/depth/camera_info" # zed
+
+        # image_camera_info_topic: "/camera/robot0_rgbd_camera/rgb/camera_info" # simulated
+        # depth_image_topic: "/camera/robot0_rgbd_camera/depth/image_raw" # simulated
+        # depth_camera_info_topic: "/camera/robot0_rgbd_camera/depth/camera_info" # simulated
+    
+    game_control_ip: "127.0.0.1"

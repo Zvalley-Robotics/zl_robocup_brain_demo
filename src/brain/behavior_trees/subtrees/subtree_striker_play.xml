@@ -1,0 +1,82 @@
+<root BTCPP_format="4" >
+   <include path="./subtree_cam_find_and_track_ball.xml" />
+   <include path="./subtree_find_ball.xml" />
+   <include path="./subtree_locate.xml" />
+   <BehaviorTree ID="StrikerPlay">
+      <ReactiveSequence>
+         <SelfLocate mode="trust_direction" msecs_interval="3000" />
+         <SubTree ID="Locate" _autoremap="true" _while="decision!='find'" />
+         <ReactiveSequence _while="wait_for_opponent_kickoff" name="wait for opponent kickoff">
+            <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
+            <SetVelocity />
+         </ReactiveSequence>
+         <ReactiveSequence _while="!wait_for_opponent_kickoff" name="our kickoff or opponent already kicked off">
+            <Sequence _while="ball_out">
+               <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
+               <GoBackInField />
+               <SubTree ID="Locate" _autoremap="true" _while="decision!='find'" />
+            </Sequence>
+            <ReactiveSequence _while="!ball_out">
+               <ReactiveSequence >
+                  <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
+                  <CalcKickDir />
+                  <Sequence>
+                     <ReactiveSequence>
+                        <!-- P2（2026-11-06）：chase_threshold 1.0 -> 0.90（先试 0.85，本轮随 P0 二次微调到 0.90）。
+                             原值 1.0 与 DistMax=1.0 完全重合，range>1.0 一律 chase，导致视觉踢窗口上半段
+                             没有“绕位对准”的机会。注：DistMax 若调大，本值必须同步抬高，否则加宽的部分无效。
+                             kick_range_min / kick_force_msec（②2026-11-06）：球距 ≥kick_range_min 时禁止行走踢抢跑，
+                             强制留在 adjust 绕位；连续 adjust 超 3 s 兜底放行，防贴线球卡死。
+                             注（2026-11-06 晚）：kick_range_min 0.45 -> 0.33，与下方 Adjust range 0.38 配套，
+                             让 0.33~0.90 全段都由 adjust 负责，为“交棒距离降到模型最佳 0.35”让路。
+                             kick_dir_align / kick_body_align 原先硬编码在 brain_tree.cpp，现参数化便于现场调。
+                             handoff_ball_speed_max / handoff_ball_still_timeout_ms（A，2026-11-06）：
+                             交棒要求球已基本静止（<0.35 m/s）。原行为在“行走踢推球之后”立刻交棒，球还在
+                             滚动，t4_kicking 追不上而被 zl 侧 KICK_ESCAPE_M=1.2 立刻收尾（实测回合仅 0.97 s）；
+                             球被对手持续推动时靠 1 s 超时放行。设 99 可关闭该门限。
+                             （2026-11-09 补）超时放行不再是“无条件”：1 s 后仍需 ballSpeed <
+                             handoff_ball_speed_relax_max=0.80，否则继续跟球不交棒。
+                             依据：11-09 场 6 次轻踢里有 3 次的交棒球速是 1.02/1.29/3.29 m/s，
+                             全是无条件超时放行 → 模型 0.5 s 建模后球已跑远，只能蹭到 0.6~0.9 m
+                             或被 adapter 的 KICK_ESCAPE_M=1.2 直接收尾。 -->
+                        <StrikerDecide decision_out="{decision}" decision_in="{decision}"
+                                       chase_threshold="0.90"
+                                       kick_dir_align="0.22" kick_body_align="0.26"
+                                       kick_range_min="0.33" kick_force_msec="3000"
+                                       handoff_ball_speed_max="0.35" handoff_ball_still_timeout_ms="1000"
+                                       handoff_ball_speed_relax_max="0.80" />
+                        <SubTree ID="FindBall" _while="decision=='find'" _autoremap="true" />
+                     </ReactiveSequence>
+                        <Assist _while="decision == 'assist'" vx_limit = "0.5" vy_limit="0.5" />
+                        <!-- C（2026-11-06）：dist 0.1 -> 0.35。目标点从“球后 0.1 m”改到“球后 0.35 m”，减少追球末段直冲球心
+                             导致冲进 <kick_range_min 后只能贴脸行走踢；现与模型最佳踢球距离 0.35 m 对齐。 -->
+                        <Chase   _while="decision == 'chase'"  vx_limit="0.9"  vy_limit="0.2"  vtheta_limit="1.0"  dist="0.35" safe_dist="0.5" />
+                        <RLVisionKick _while="decision == 'auto_visual_kick'" min_msec_kick="1500" max_msec_kick="3000" range="6.0"/>
+                        <!-- vtheta 增益/上限 1.5/1.5 -> 1.0/1.0（与 Chase 对齐）：3588 取消速度折半后本体 1:1 执行，
+                             Adjust 的实际转向角速度翻倍，ballYaw>46° 即打满全局 vtheta_limit=1.2；配合约 100~200ms
+                             执行滞后，200ms 过冲约 0.24rad 远超 0.1rad 死区，形成左右来回摆的极限环。
+                             降到 1.0 后饱和门限回到约 57°，过冲约 0.20rad。如仍偏大，下一步降到 0.75/0.8。 -->
+                        <!-- P0（2026-11-06）：range 0.4 -> 0.60（首轮 0.55，本轮二次微调）。原绕球半径与视觉踢下限
+                             autoVisualKickEnableDistMin=0.40 完全重合，而 Adjust 的径向项 sr=cap(R-range,0.5,0)
+                             只能靠近不能后退，对准完成时必然压到 0.40 以下（实测对齐达成时 73% 的拍子球距已 <0.40）。
+                             tangential_speed_near 0.15 -> 0.25：贴近对准时绕位快一点，缩短 adjust 停留。
+                             （2026-11-06 晚，三调）range 0.60 -> 0.38：踢球模型（t4_kicking）的最佳起脚距离是 0.35 m，
+                             而交棒球距一直停在 0.50~0.55（Adjust 的收口点就是 range）。收到 0.38 后交棒球距预期
+                             落在 0.36~0.42，接近模型最佳值；需与 DistMin=0.28（config_local）和 kick_range_min=0.33 同批。
+                             风险：0.32~0.37 交棒曾出现 adapter 侧可见拍仅 3%~26%（2026-10-31，旧配置），
+                             （2026-11-09 晚）backoff_margin=0.12 / backoff_speed=0.30：range=0.38 已接近机身半径
+                             （腿尖距球 ~3 cm），切向绕行一圈必然把球蹭走 → 球被挪到脚边、视觉踢更难满足、
+                             绕满 3 s 兜底放行行走踢（实测 adjust 兜底 3→6 次、行走踢 3→7 次）。
+                             现未对准时先在 range+0.12 处绕行（腿扫不到），且径向项允许负值后退到目标半径；
+                             一旦对准（|deltaDir|≤0.20）目标半径回到 range=0.38，交棒球距不变。
+                             backoff_speed=0 可完全退回旧行为（只能靠近、不能后退）。 -->
+                        <Adjust _while="decision =='adjust'" turn_threshold="0.5" range="0.38" vx_limit="0.7" vy_limit="0.6" vtheta_limit="1.0" vtheta_factor="1.0" tangential_speed_far="0.7" tangential_speed_near="0.25" backoff_margin="0.12" backoff_speed="0.30" />
+                        <Kick _while="decision == 'kick'" speed_limit="0.8" min_msec_kick="1000" msecs_stablize="1000"/>
+                        <Kick _while="decision == 'cross'" speed_limit="0.4" min_msec_kick="300"/>
+                  </Sequence>
+               </ReactiveSequence>
+            </ReactiveSequence>
+         </ReactiveSequence>
+      </ReactiveSequence>
+   </BehaviorTree>
+</root>

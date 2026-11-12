@@ -1,0 +1,13 @@
+<root BTCPP_format="4" >
+   <include path="./subtree_cam_find_and_track_ball.xml" />
+   <include path="./subtree_find_ball.xml" />
+   <include path="./subtree_locate.xml" />
+   <BehaviorTree ID="GoalKeeperFreekick">
+      <ReactiveSequence >
+         <SubTree ID="CamFindAndTrackBall" _autoremap="true" />
+         <GoToReadyPosition _while="!ball_location_known" />
+         <GoToGoalBlockingPosition _while="ball_location_known" dist_tolerance="0.4" theta_tolerance="0.3" dist_to_goalline="1.5" />
+         <SelfLocate mode="trust_direction" _while="odom_calibrated" msecs_interval="3000" />
+      </ReactiveSequence>
+   </BehaviorTree>
+</root>

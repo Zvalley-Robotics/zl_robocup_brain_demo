@@ -1,0 +1,40 @@
+# 视觉本机/整机覆盖层模板（可选）。
+#
+# 用法：
+#   cp src/vision/config/vision_local.yaml.example src/vision/config/vision_local.yaml
+# 按本机相机与安装重新标定后填写。vision_local.yaml 已被 .gitignore 忽略。
+#
+# 加载顺序（后者逐键覆盖前者，缺失的层会自动跳过）：
+#   vision.yaml -> vision_local.yaml -> ~/agents/soccer/vision.yaml
+#
+# vision.yaml 中的 camera.intrin / camera.extrin 只是示例标定值；
+# 更换相机、镜头或机器人安装后必须重新标定，建议只在本文件里覆盖。
+
+camera:
+  # 按实际相机驱动的话题修改；话题名包含 "compressed" 时走 CompressedImage 分支。
+  color_topic: "/camera/camera/color/image_raw"
+  depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+  intrin_topic: "/camera/camera/color/camera_info"
+  base_height_above_foot: 0.83
+
+  # 示例占位，务必替换为本机标定值（calibration_node 可生成）。
+  # intrin:
+  #   fx: 388.0
+  #   fy: 387.4
+  #   cx: 324.1
+  #   cy: 244.1
+  #   distortion_model: 0
+  #   distortion_coeffs: []
+
+# 模型路径可用相对路径（相对于 vision 包 share 目录，或当前工作目录），
+# 也建议直接用 launch 参数 detection_model_path / segmentation_model_path 覆盖。
+# detection_model:
+#   model_path: model/det_261019_fp16.engine
+# segmentation_model:
+#   model_path: model/seg_261027_fp16.engine
+
+# 手眼标定结果（仅 aarch64 的 calibration_node 使用）。
+# calibration:
+#   handeye:
+#     calibration_time: "YYYY-MM-DD-HH-MM-SS"
+#     reprojection_error: 0.0

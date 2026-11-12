@@ -1,0 +1,124 @@
+# 视觉基线配置：所有机器共用。
+# 逐机差异（相机话题、内外参、手眼标定、模型）请写入 vision_local.yaml
+# （模板见 vision_local.yaml.example；该文件不随仓库提交），或由 launch 参数覆盖。
+# 加载顺序：vision.yaml -> vision_local.yaml -> ~/agents/soccer/vision.yaml。
+camera:
+  # color_topic: "/camera/robot0_rgbd_camera/rgb/image_compressed" # sim
+  # depth_topic: "/camera/robot0_rgbd_camera/depth/image_raw" # sim
+  # intrin_topic: "/camera/robot0_rgbd_camera/rgb/camera_info" # sim
+
+  color_topic: "/camera/camera/color/image_raw" # d-robotics
+  depth_topic: "/camera/camera/aligned_depth_to_color/image_raw" # d-robotics
+  intrin_topic: "/camera/camera/color/camera_info" # d-robotics
+
+  # color_topic: "/camera/color/image_raw" # orbbec
+  # depth_topic: "/camera/depth/image_raw" # orbbec
+  # intrin_topic: "/camera/color/camera_info" # orbbec
+
+  # color_topic: "/camera/camera/color/image_raw" # realsense
+  # depth_topic: "/camera/camera/aligned_depth_to_color/image_raw" # realsense
+  # intrin_topic: "/camera/camera/color/camera_info" # realsense
+
+  # color_topic: "/zed/zed_node/left/image_rect_color" # zed
+  # depth_topic: "/zed/zed_node/depth/depth_registered" # zed
+  # intrin_topic: "/zed/zed_node/left/camera_info" # zed
+  # /robot/head_to_base maps the camera optical frame to base_link.
+  # The base origin is this many metres above the foot origin; add this
+  # height along the base/foot Z axis to recover camera -> foot for projection.
+  base_height_above_foot: 0.83
+  # 以下 intrin/extrin 是一台实机的示例标定值，仅用于跑通链路。
+  # 换相机、换镜头或换安装后必须重新标定，并通过 vision_local.yaml 覆盖。
+  intrin:
+    fx: 387.99981689453125
+    fy: 387.4111328125
+    cx: 324.146240234375
+    cy: 244.1136932373047
+    distortion_model: 0
+    distortion_coeffs:
+      []
+  extrin:
+    # Legacy calibration-node input only. vision_node no longer uses this
+    # eye->head extrinsic; the vision node uses the complete eye->base pose.
+    # cam(x right y down z forward) -> head(x forward y left z up)
+    # Note: pitch compensation is done in code, here we only put the real offset of
+    -
+      - 0.0753363073
+      - 0.0190046262
+      - 0.996977091
+      - -0.0122268423
+    -
+      - -0.99715662
+      - -0.000328667404
+      - 0.0753561407
+      - 0.0440084077
+    -
+      - 0.00175978895
+      - -0.999819338
+      - 0.018925827
+      - -0.0283811111
+    -
+      - 0
+      - 0
+      - 0
+      - 1
+  # Legacy calibration-node values; ignored by vision_node in eye->foot mode.
+  pitch_compensation: 0
+  yaw_compensation: 0
+  z_compensation: 0
+detection_model:
+  # 相对路径先按当前工作目录解析，找不到再到 vision 包 share 目录下解析；
+  # 也可用 launch 参数 detection_model_path 覆盖（绝对路径最稳）。
+  model_path: model/det_261019_fp16.engine
+  confidence_threshold: 0.2
+  nms_threshold: 0.4
+  classnames: [Ball, Goalpost, LCross, TCross, XCross, PenaltyPoint, Opponent, Person]
+  post_process:
+    single_ball_assumption: false
+    confidence_thresholds:
+      # Ball 沿用同事 2026-11-04 版取值；其余类别按本仓实测值。
+      Ball: 0.6
+      Goalpost: 0.2
+      LCross: 0.4
+      TCross: 0.4
+      XCross: 0.4
+      PenaltyPoint: 0.1
+      Opponent: 0.6
+      Person: 0.6
+segmentation_model:
+  model_path: model/seg_261027_fp16.engine
+  confidence_threshold: 0.3
+  nms_threshold: 0.9
+  # -1 = 不按类别过滤（seg_261027 单类模型）；
+  # 回退多类模型（football_20260701 / 仿真 sim_data_seg_0126）时改回 1。
+  field_line_class_id: -1
+use_depth: true
+ball_pose_estimator:
+  use_depth: true
+  radius: 0.109
+  near_ball_radius_tolerance: 0.03
+  projected_radius_tolerance: 0.04
+  down_sample_leaf_size: 0.01
+  cluster_distance_threshold: 0.01
+  fitting_distance_threshold: 0.01
+  minimum_cluster_size: 100
+  minimum_inlier_ratio: 0.4
+  filter_distance: 1.2
+  check_ball_height: true
+human_like_pose_estimator:
+  use_depth: false
+  down_sample_leaf_size: 0.01
+  fitting_distance_threshold: 0.01
+  statistic_outlier_multiplier: 0.01
+field_marker_pose_estimator:
+  refine: true
+  line_segment_area_threshold: 75
+calibration:
+  sync_max_time_diff_ms: 1400
+  offset:
+    exclude_distance: 2.0
+    zero_translation: true
+    field_marker_path: ./src/vision/config/field.yaml  # 相对于当前工作目录
+  # 手眼标定结果因整机而异，请写入 vision_local.yaml（见模板）。
+misc:
+  save_data_nonstationary: true
+robot_name: "" # If there are multiple robots, specify the name, e.g., "robot0", "robot1", etc. Leave empty for a single robot

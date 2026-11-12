@@ -1,0 +1,24 @@
+/build/
+/install/
+/log/
+__pycache__/
+*.pyc
+
+# 本机/现场配置覆盖层（模板见同名 .example 文件，不要提交真实值）
+src/brain/config/config_local.yaml
+src/vision/config/vision_local.yaml
+
+# 运行期数据与工具产物
+vision_log/
+calibration_log/
+exported_model/
+compile_commands.json
+.cache/
+*.log
+
+# 编辑器/系统文件
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

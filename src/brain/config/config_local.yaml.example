@@ -1,0 +1,29 @@
+# 本机/现场覆盖层模板（可选）。
+#
+# 用法：
+#   cp src/brain/config/config_local.yaml.example src/brain/config/config_local.yaml
+# 然后按现场修改。config_local.yaml 已被 .gitignore 忽略，不要提交真实站点配置。
+#
+# 加载顺序（后者逐键覆盖前者，缺失的层会被 launch.py 自动跳过）：
+#   config.yaml -> config_local.yaml -> ~/agents/soccer/brain.yaml -> launch 内联参数
+#
+# 只写与基线（config.yaml）不同的键；与基线同值的键不要重复写，避免静默漂移。
+# 核对实际生效值（不要凭 yaml 推断）：
+#   ros2 param get /brain_node game_control_ip
+#   ros2 param dump /brain_node
+
+brain_node:
+  ros__parameters:
+    # 裁判机 GameController 回传地址（UDP 3939）。
+    # 127.0.0.1 表示只接收本机发布的 /soccer/game_controller；
+    # 现场使用裁判机单播时改为裁判机实际 IP，并建议给裁判机做 DHCP 保留。
+    game_control_ip: "127.0.0.1"
+
+    # 仿真/联调：若不由仿真器注入真值球，可打开该开关。
+    # ground_truth:
+    #   enable_ball: true
+
+    # 视觉踢球触发窗（米）：按机型、场地和踢球模型实测调整。
+    # RLVisionKick:
+    #   autoVisualKickEnableDistMin: 0.28
+    #   autoVisualKickEnableDistMax: 0.60
