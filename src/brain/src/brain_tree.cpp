@@ -584,12 +584,24 @@ NodeStatus Chase::tick()
     vy = cap(vy, vyLimit, -vyLimit);
     vtheta = cap(vtheta, vthetaLimit, -vthetaLimit);
 
-    // 队友贴身单侧让位：Chase 自身只看深度障碍栅格（不含队友坐标），双 lead 瞬态或两台
-    // 同时收敛到同一球后点时没有任何去冲突，实测会直接顶在一起。由 (cost, id) 仲裁后
-    // 只让较差的一台退开；球已进入 0.8 m 踢球窗时不干预（交给 Adjust/kick）。
+    // 速度包络（2026-11-17）：节点限速只是“上限”，真正的行进速度还要看清距。
+    // 放在让位之前：让位速度是脱离纠缠用的，不参与包络。vx 是机体系前向量（vy 恒 0），
+    // 故障碍清距取机体系前向 0。
+    {
+        const double envCap = brain->speedEnvelopeCap(0.0, "chase");
+        if (vx > envCap) vx = envCap;
+    }
+
+    // 队友贴身单侧让位：Chase 只看深度栅格（不含队友坐标），双 lead 瞬态下没有去冲突。
+    // 由 (cost, id) 仲裁 + 0.5 m 硬门限决定谁退，退出时侧向切出；提前量 1.2 m（接近速度可达
+    // 1.2 m/s，0.7 m 触发只留 0.5 s 来不及）。球已进 0.8 m 踢球窗时不干预。
     {
         double yieldVx, yieldVy, yieldVtheta;
-        if (brain->calcChaseYieldVelocity(yieldVx, yieldVy, yieldVtheta, 0.8)) {
+        // heading 传“我到追球目标点”的方向：只对挡在这条路线上的队友让位
+        const double chaseHeading = atan2(
+            target_f.y - brain->data->robotPoseToField.y,
+            target_f.x - brain->data->robotPoseToField.x);
+        if (brain->calcChaseYieldVelocity(yieldVx, yieldVy, yieldVtheta, 1.0, 2.0, 1.2, chaseHeading)) {
             brain->client->setVelocity(yieldVx, yieldVy, yieldVtheta);
             return NodeStatus::SUCCESS;
         }
@@ -1015,14 +1027,26 @@ NodeStatus Assist::tick() {
 
 
     Pose2D targetPose;
-    // GK 管辖区（球 x < -L/2+penaltyAreaLength+1.0，与 GoalieDecide/StrikerDecide 同一条线）：
-    // 球进自家后场后由 GK 负责清球，两个接应前锋就近分工：离本方门更近的一台退守门线前
-    // 补门（二次门将），另一台退中场接应位等 GK 清球后上前拦截反击；
-    // 保证球被压到禁区时门前始终有人协防，避免全队只留 GK 一人守空门。
-    // 原"球前方 2m/4m"公式经 floor 后会在球进后场时塌到门线前与 GK 站位点重合，
-    // 接应前锋也挤在门前——这是"都去抢球"画面的另一半来源。
+    // GK 管辖区（球 x < -L/2+penaltyAreaLength+1.0）：球进自家后场后由 GK 清球，两台前锋
+    // 就近分工——离本方门更近的退守门线前补门，另一台退中场接应位等反击，避免门前只留 GK。
+    // 原“球前 2m/4m”公式经 floor 后会在球进后场时塌到 GK 站位点，前锋全挤在门前。
     bool gkZone = ballPos.x < -fd.length / 2.0 + fd.penaltyAreaLength + 1.0;
     if (gkZone) {
+        // 门将状态仲裁（2026-11-16）：门将在禁区里贴球时门前已有人，前锋不再穿过去“补位”
+        bool gkAlive = false, gkHandling = false;
+        double gkX = 0.0, gkY = 0.0, gkBall = 1e9;
+        for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+            if (i == selfIdx) continue;
+            auto &tm = brain->data->tmStatus[i];
+            if (tm.role != "goal_keeper" || !tm.isAlive) continue;
+            if (brain->msecsSince(tm.timeLastCom) > 1000) continue;
+            gkAlive = true;
+            gkX = tm.robotPoseToField.x;
+            gkY = tm.robotPoseToField.y;
+            gkBall = tm.ballRange;
+            gkHandling = gkBall < 1.5 && gkX < -fd.length / 2.0 + fd.penaltyAreaLength + 0.5;
+            break;
+        }
         // 门前协防分配（去中心化，两台独立计算须互斥且一致）：
         // 到本方门中心距离最近的前锋守门前；队友明显更近（>0.5m）或距离接近（<0.5m 死区）
         // 但 player_id 更小时让位——死区按 id 裁决，保证两机算出同一结果（恰有一台去门前）。
@@ -1043,16 +1067,31 @@ NodeStatus Assist::tick() {
                 break;
             }
         }
-        if (goFront) {
-            // 门前补位（二次门将）：站门线前 0.6m 的"球—门中心"射线上封门中路，
-            // 与 GK 站位点（门线前 1.5m，x=-5.5）前后错开 ~0.9m，不挤占 GK 出击空间。
-            targetPose.x = -fd.length / 2.0 + 0.6;
+        if (gkHandling) {
+            targetPose.x = -1.2;
+            targetPose.y = (brain->config->get_player_id() % 2 == 0) ? 1.5 : -1.5;
+        } else if (goFront) {
+            // 门前补位：门将在场时退到禁区线内 0.6 m 并偏侧，避开原门线点穿过门将的路线
+            targetPose.x = gkAlive ? (-fd.length / 2.0 + fd.penaltyAreaLength - 0.6)
+                                   : (-fd.length / 2.0 + 0.6);
             double frontDenom = max(ballPos.x + fd.length / 2.0, 0.5);
-            targetPose.y = ballPos.y * (targetPose.x + fd.length / 2.0) / frontDenom;
-            targetPose.y = cap(targetPose.y, fd.goalWidth / 2.0 - 0.2, -fd.goalWidth / 2.0 + 0.2);
+            double baseY = ballPos.y * (targetPose.x + fd.length / 2.0) / frontDenom;
+            if (gkAlive) {
+                const double yA = baseY + 1.0, yB = baseY - 1.0;
+                baseY = fabs(yA - gkY) >= fabs(yB - gkY) ? yA : yB;
+            }
+            targetPose.y = cap(baseY, fd.goalWidth / 2.0 - 0.2, -fd.goalWidth / 2.0 + 0.2);
         } else {
             targetPose.x = -1.2;
             targetPose.y = (brain->config->get_player_id() % 2 == 0) ? 1.5 : -1.5;
+        }
+        static rclcpp::Time lastGkLog = brain->get_clock()->now();
+        if (brain->msecsSince(lastGkLog) > 1000) {
+            lastGkLog = brain->get_clock()->now();
+            RCLCPP_INFO(brain->get_logger(),
+                "[assist_gk] branch=%s gkAlive=%d gkBall=%.2f gk=(%.2f,%.2f) target=(%.2f,%.2f) ball=(%.2f,%.2f)",
+                gkHandling ? "mid" : (goFront ? "cover" : "mid2"), gkAlive ? 1 : 0, gkBall, gkX, gkY,
+                targetPose.x, targetPose.y, ballPos.x, ballPos.y);
         }
     } else {
         targetPose.x = isSecondary ? ballPos.x - 4.0 : ballPos.x - 2.0;
@@ -1071,10 +1110,12 @@ NodeStatus Assist::tick() {
 
     double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
 
-    // 队友贴身让位：贴近最近队友时沿背离方向低速退开（门线防守等队友拥有优先权），
-    // 让位期间不判定到位，避免双方互相顶住形成僵持（实现在 Brain::calcTeammateSeparationVelocity）
+    // 队友贴身单侧让位：贴近最近队友时侧向切出，让位期间不判定到位，避免互相顶住
+    // （实现在 Brain::calcTeammateSeparationVelocity）。提前量 1.2 m + 0.6 m/s：0.7 m/0.3 m/s
+    // 只能在机身重叠后“维持不死锁”，挡不住 assist 全速走向接应点。
     double sepVx, sepVy, sepVtheta;
-    if (brain->calcTeammateSeparationVelocity(sepVx, sepVy, sepVtheta)) {
+    const double assistHeading = atan2(targetPose.y - robotPose.y, targetPose.x - robotPose.x);
+    if (brain->calcTeammateSeparationVelocity(sepVx, sepVy, sepVtheta, 2.0, 1.0, assistHeading)) {
         brain->client->setVelocity(sepVx, sepVy, sepVtheta);
         return NodeStatus::SUCCESS;
     }
@@ -1089,6 +1130,49 @@ NodeStatus Assist::tick() {
     double vx, vy, vtheta;
     auto targetPose_r = brain->data->field2robot(targetPose);
     double targetDir = atan2(targetPose_r.y, targetPose_r.x);
+
+    // 走廊前瞻避让（2026-11-16）：队友在“我→目标”走廊内时先偏转绕行，不等贴身再切出
+    {
+        constexpr double CORRIDOR_LEN = 3.0;
+        constexpr double CORRIDOR_HALF_W = 0.9;
+        constexpr double DODGE_DEG = 60.0;
+        const double headingF = atan2(targetPose.y - robotPose.y, targetPose.x - robotPose.x);
+        const double ch = cos(headingF), sh = sin(headingF);
+        double nearAlong = 1e9, nearLateral = 0.0;
+        for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+            if (i == selfIdx) continue;
+            auto &tm = brain->data->tmStatus[i];
+            if (!tm.isAlive || brain->msecsSince(tm.timeLastCom) > 1000) continue;
+            const double dx = tm.robotPoseToField.x - robotPose.x;
+            const double dy = tm.robotPoseToField.y - robotPose.y;
+            const double along = dx * ch + dy * sh;
+            const double lateral = -dx * sh + dy * ch;
+            if (along <= 0.3 || along > CORRIDOR_LEN || fabs(lateral) > CORRIDOR_HALF_W) continue;
+            if (along < nearAlong) { nearAlong = along; nearLateral = lateral; }
+        }
+        if (nearAlong < 1e8) {
+            // 往队友另一侧绕；若那一侧更贴边则换侧
+            double side = (nearLateral > 0) ? -1.0 : 1.0;
+            auto sideClearance = [&](double s) {
+                const double a = headingF + s * deg2rad(DODGE_DEG);
+                return min(fd.length / 2.0 - fabs(robotPose.x + 1.5 * cos(a)),
+                           fd.width / 2.0 - fabs(robotPose.y + 1.5 * sin(a)));
+            };
+            if (sideClearance(side) < sideClearance(-side)) side = -side;
+            const double ang = side * deg2rad(DODGE_DEG);
+            const double rx = targetPose_r.x, ry = targetPose_r.y;
+            targetPose_r.x = rx * cos(ang) - ry * sin(ang);
+            targetPose_r.y = rx * sin(ang) + ry * cos(ang);
+            targetDir = toPInPI(targetDir + ang);
+            static rclcpp::Time lastDodgeLog = brain->get_clock()->now();
+            if (brain->msecsSince(lastDodgeLog) > 1000) {
+                lastDodgeLog = brain->get_clock()->now();
+                RCLCPP_INFO(brain->get_logger(), "[assist_dodge] tmAlong=%.2f tmLat=%.2f side=%+.0f target=(%.2f,%.2f)",
+                            nearAlong, nearLateral, side, targetPose.x, targetPose.y);
+            }
+        }
+    }
+
     double distToObstacle = brain->distToObstacle(targetDir);
 
     bool avoidObstacle = brain->config->get_avoid_during_chase();
@@ -1603,7 +1687,28 @@ NodeStatus StrikerDecide::tick() {
     // 球位来源刚在 LOCAL/TM 之间切换（两套场系差 0.7~1.4 m）：短暂禁踢，让位置先稳定。
     // 被拒的回合会落到 adjust 继续绕球，保护窗（默认 150 ms）过后自动恢复。
     const bool ballSrcGuard = brain->tree->getEntry<bool>("ball_src_guard");
-    // 贴身可踢预判（复用原 kick 分支条件，仅用于 GK 区特判；isFreekickKickingOff 状态清理仍只在真正进入 kick 分支时执行）
+    // 起脚前队友门：最近队友挡在出球方向上时把 kick/cross/auto_visual_kick 降级为 adjust。
+    // 门限 0.8 m / ±60°（偏角大说明队友不在出球线上，不必拦）；拦超过 TM_KICK_BLOCK_MAX_MS
+    // 放行，避免队友倒地卡在出球线上时整轮球权作废。
+    int blockTmIdx = -1;
+    double blockTmDist = 0.0;
+    const bool teammateBlockingKick = brain->isTeammateBlockingKick(0.8, 1.05, &blockTmIdx, &blockTmDist);
+    constexpr double TM_KICK_BLOCK_MAX_MS = 2500.0;
+    static bool wasKickBlocked = false;
+    static rclcpp::Time kickBlockStart = brain->get_clock()->now();
+    if (teammateBlockingKick && !wasKickBlocked) kickBlockStart = brain->get_clock()->now();
+    wasKickBlocked = teammateBlockingKick;
+    const bool kickBlockExpired = teammateBlockingKick &&
+        brain->msecsSince(kickBlockStart) > TM_KICK_BLOCK_MAX_MS;
+    const bool kickHeldByTeammate = teammateBlockingKick && !kickBlockExpired;
+    static rclcpp::Time lastKickBlockLog = brain->get_clock()->now();
+    if (teammateBlockingKick && brain->msecsSince(lastKickBlockLog) > 1000) {
+        lastKickBlockLog = brain->get_clock()->now();
+        brain->log->log("striker_decide", format("kick blocked by teammate: P%d at %.2f m in kickDir cone, hold=%d blockedMs=%.0f",
+            blockTmIdx + 1, blockTmDist, kickHeldByTeammate ? 1 : 0, brain->msecsSince(kickBlockStart)));
+    }
+    // 贴身可踢预判（复用原 kick 分支条件，仅用于 GK 区特判；isFreekickKickingOff 的
+    // 状态清理仍只在真正进入 kick 分支时执行）
     bool canKickNow =
         (
             (angleGoodForKick && !brain->data->isFreekickKickingOff) 
@@ -1907,6 +2012,42 @@ NodeStatus GoalieDecide::tick()
     return NodeStatus::SUCCESS;
 }
 
+// 起脚前队友门兜底：decision 层的降级只能挡“还没进 kick”的拍子，队友可能在 Kick 已
+// RUNNING 后才走过来。被挡时不下发推进，改侧向切出让对方先过；返回 true 表示已自行下发。
+static bool kickBlockedByTeammate(Brain *brain) {
+    int blockIdx = -1;
+    double blockDist = 0.0;
+    static bool wasBlocked = false;
+    static rclcpp::Time blockStart = brain->get_clock()->now();
+    if (!brain->isTeammateBlockingKick(0.8, 1.05, &blockIdx, &blockDist)) {
+        wasBlocked = false;
+        return false;
+    }
+    if (!wasBlocked) {
+        wasBlocked = true;
+        blockStart = brain->get_clock()->now();
+    }
+    // 卡死兜底：拦超过 2.5 s 就放行（与 StrikerDecide 里的降级门限同步），
+    // 否则队友倒地/卡在出球线上会把本节点一直拦到超时，一次也踢不出去
+    constexpr double MAX_BLOCK_MS = 2500.0;
+    if (brain->msecsSince(blockStart) > MAX_BLOCK_MS) return false;
+
+    double cutVx = 0, cutVy = 0, cutVtheta = 0;
+    if (brain->calcTeammateSeparationVelocity(cutVx, cutVy, cutVtheta, 1.2, 0.6, brain->data->kickDir)) {
+        brain->client->setVelocity(cutVx, cutVy, cutVtheta);
+    } else {
+        brain->client->setVelocity(0, 0, 0);
+    }
+    // 1 Hz INFO 留证：现场要能区分“没起脚”与“被队友挡住”
+    static rclcpp::Time lastLog = brain->get_clock()->now();
+    if (brain->msecsSince(lastLog) > 1000) {
+        lastLog = brain->get_clock()->now();
+        RCLCPP_INFO(brain->get_logger(), "[kick_block] teammate P%d at %.2f m blocks kickDir, side-step vx=%.2f vy=%.2f ball=%.2f m",
+            blockIdx + 1, blockDist, cutVx, cutVy, brain->data->ball.range);
+    }
+    return true;
+}
+
 tuple<double, double, double> Kick::_calcSpeed() {
     double vx, vy, msecKick;
 
@@ -1968,6 +2109,8 @@ NodeStatus Kick::onStart()
     _speed = 0.5;
     _startTime = brain->get_clock()->now();
 
+    // 起脚前队友门兜底：队友挡在出球方向时本拍不推进，改侧向切出（见 kickBlockedByTeammate）
+    if (kickBlockedByTeammate(brain)) return NodeStatus::RUNNING;
 
     bool avoidPushing = brain->config->get_avoid_during_kick();
     double kickAoSafeDist = brain->config->get_kick_ao_safe_dist();
@@ -2057,26 +2200,37 @@ NodeStatus Kick::onRunning()
         return NodeStatus::SUCCESS;
     }
 
+    // 起脚前队友门兜底（放在超时判定之后：被队友堵住也照常到时结束，不把 Kick 钉死）
+    if (kickBlockedByTeammate(brain)) return NodeStatus::RUNNING;
+
 
     if (brain->data->ballDetected && ballAgeMs <= ballFreshMs) {
-        double angle = brain->data->ball.yawToRobot;
+        const double ballYawNow = brain->data->ball.yawToRobot;
+        const double ballRangeNow = brain->data->ball.range;
+        const string role = brain->tree->getEntry<string>("player_role");
+        // 贴脚（≤ 0.25 m，相机盲区、ballYaw 不可信）→ 纯前推，vtheta 只对 kickDir；
+        // 未贴脚但球偏在侧前方 → 先驻停转向，摆正后再推（见 kickAimOnly）。
+        const double pushAngle = (ballRangeNow <= 0.25) ? 0.0 : ballYawNow;
+        if (role != "goal_keeper" && kickAimOnly(brain, ballRangeNow, ballYawNow)) {
+            return NodeStatus::RUNNING;
+        }
         double speed = getInput<double>("speed_limit").value();
         _speed += 0.1; 
         speed = min(speed, _speed);
-        if (brain->tree->getEntry<string>("player_role") == "goal_keeper") {
+        if (role == "goal_keeper") {
             // 守门员：推进中逐 tick 跟踪球方位保持转向（同上）
-            double vtheta = cap(angle * 1.5, 0.8, -0.8);
-            brain->client->crabWalk(angle, speed, vtheta);
+            double vtheta = cap(pushAngle * 1.5, 0.8, -0.8);
+            brain->client->crabWalk(pushAngle, speed, vtheta);
         } else {
-            double vtheta = _alignVtheta(angle);
+            double vtheta = _alignVtheta(pushAngle);
             static uint64_t align_log_cnt = 0;
             if (++align_log_cnt % 10 == 0) {
                 const double bodyErr =
                     toPInPI(brain->data->kickDir - brain->data->robotPoseToField.theta);
                 brain->log->log("Kick", format("align bodyErr=%.2f ballYaw=%.2f vtheta=%.2f range=%.2f",
-                                               bodyErr, angle, vtheta, ballRange));
+                                               bodyErr, ballYawNow, vtheta, ballRange));
             }
-            brain->client->crabWalk(angle, speed, vtheta);
+            brain->client->crabWalk(pushAngle, speed, vtheta);
         }
     } else if (ballAgeMs > ballFreshMs) {
         // 球已看不见（被踢走 / 被腿遮挡超过当前窗口：近距 500 ms、远端 300 ms）：原实现没有 else，
@@ -2444,6 +2598,20 @@ NodeStatus GoToReadyPosition::tick()
         tx = -fd.length / 2.0 + fd.goalAreaLength;
         ty = 0;
         ttheta = 0;
+    }
+
+    // READY 走位的队友让位：深度栅格不含队友坐标，moveToPoseOnField2 无让行仲裁
+    {
+        double yieldVx, yieldVy, yieldVtheta;
+        const double readyHeading = atan2(ty - brain->data->robotPoseToField.y,
+                                          tx - brain->data->robotPoseToField.x);
+        // minBallRange=0：READY 不受踢球窗豁免
+        if (brain->calcChaseYieldVelocity(yieldVx, yieldVy, yieldVtheta, 0.0, 2.0, 1.0, readyHeading))
+        {
+            const double headErr = toPInPI(readyHeading - brain->data->robotPoseToField.theta);
+            brain->client->setVelocity(yieldVx, yieldVy, cap(headErr, 0.6, -0.6));
+            return NodeStatus::SUCCESS;
+        }
     }
 
     brain->client->moveToPoseOnField2(tx, ty, ttheta, longRangeThreshold, turnThreshold, vxLimit, vyLimit, vthetaLimit, distTolerance / 1.5, distTolerance / 1.5, thetaTolerance, avoidObstacle);

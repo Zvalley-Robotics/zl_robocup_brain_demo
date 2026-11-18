@@ -282,32 +282,74 @@ public:
     bool calcSafeAvoidDir(double startAngle, double safeDist, double maxOffsetRad, double &outDir);
 
     /**
-     * @brief 队友贴身让位速度：最近的存活队友距离小于 rSep 时，输出沿背离该队友方向
-     *        低速退开的速度（robot 坐标系）。调用方应直接下发该速度并跳过本周期的到位
-     *        判定，避免与队友互相顶住形成僵持（门线防守等队友拥有优先权）。
-     *        触发条件留有余量（默认 0.7 m），须大于模拟器的物理分离距离 0.6 m。
+     * @brief 队友贴身让位速度（侧向切出版，2026-11-12 改）。
+     *
+     * 最近的存活队友距离小于 rSep 时，输出沿「队友连线」垂直线切出的速度（robot 坐标系），
+     * 不再沿背离方向直退：实测两机对撞时双方都按背离方向退，退让方向正好被对方顶住，
+     * 机身重叠 1.2 s（间距 0.03 m）也撤不开。切出的一侧选「切出后离球更远」的那条，
+     * 既离开队友又不把球让出去；贴边时改选指向场内的一侧，两侧都贴边才退回背离方向。
+     * 调用方应直接下发该速度并跳过本周期到位判定。
      *
      * @param vx vy vtheta double&, 退让速度输出（robot 坐标系；vtheta 保持面向球）
-     * @param rSep double, 触发距离（默认 0.7）
-     * @param speed double, 退让线速度（默认 0.3，即 setVelocity 的最小速度下限）
+     * @param rSep double, 触发距离（默认 0.7；追球/绕球链路传 0.9~1.2 做提前量）
+     * @param speed double, 切出线速度（默认 0.3；避碰用 0.6~0.8，贴身解纠缠用 0.3）
+     * @param headingRad double, 我可选：我本拍想走的方向（场地系）。传了就只对「挡在我行进
+     *        方向 ±70° 内」的队友让位；不传（1e9）退化为只看距离。带方向判据可以避免
+     *        并排走位/站位时无谓地反复让开又回去（大于 0.5 m 才生效，贴身时一律让）。
      *
      * @return bool, true=输出有效退让速度
      */
-    bool calcTeammateSeparationVelocity(double &vx, double &vy, double &vtheta, double rSep = 0.7, double speed = 0.3);
+    bool calcTeammateSeparationVelocity(double &vx, double &vy, double &vtheta, double rSep = 0.7, double speed = 0.3,
+                                        double headingRad = 1e9);
 
     /**
      * @brief 追球/绕球阶段（Chase、Adjust）的单侧队友让位。
      *
-     * 与 calcTeammateSeparationVelocity 的区别：本函数先用 (cost, player_id) 仲裁决定
-     * 「该不该由我退」，只有明显更差（或同档且 id 更大）的一台才输出退让速度，因此
-     * 同一时刻只有一台在退，不会出现两台互相退开的活锁。球已进入踢球距离时不让位，
-     * 避免把正在起脚的一台拽离球。最近队友是门将时无条件让位（门将拥有优先权）。
+     * 与 calcTeammateSeparationVelocity 的区别：本函数先仲裁决定「该不该由我退」，只有
+     * 明显更差的（或同档且 id 更大的）一台才输出切出速度，因此同一时刻只有一台在退。
+     * 仲裁分两层（2026-11-12）：
+     *   1) 距离 < HARD_YIELD_DIST(0.5 m)：不看 cost，直接按 player_id 大者退。实测两台
+     *      前锋会各自判「对方更差 → 我不退」（cost 一个是本机实时值、一个是对方 100 ms
+     *      前广播 + 中值滤波），结论不互补，于是双双不让、直接顶在一起；硬门限保证
+     *      贴近时必然有一方在退。
+     *   2) 距离 ≥ 0.5 m：仍用 (cost, player_id) 仲裁，避免正常追球时无谓退让。
+     * 球已进入踢球距离（minBallRange）时只在硬门限内干预，避免把正在起脚的一台拽离球。
+     * 最近队友是门将时无条件让位（门将拥有优先权）。
      *
-     * @param vx vy vtheta double&, 退让速度输出（robot 坐标系）
+     * @param vx vy vtheta double&, 让位速度输出（robot 坐标系）
      * @param minBallRange double, 球距小于该值时不触发让位（Chase 用 0.8，Adjust 用 0.55）
+     * @param rSep double, 触发距离（提前量，Chase 用 1.2，Adjust 用 0.9）
+     * @param speed double, 切出线速度（Chase 用 0.8，Adjust 用 0.6）
+     * @param headingRad double, 我本拍想走的方向（场地系），透传给
+     *        calcTeammateSeparationVelocity 做方向判据；不传则只看距离
      * @return bool, true=输出有效退让速度
      */
-    bool calcChaseYieldVelocity(double &vx, double &vy, double &vtheta, double minBallRange = 0.8);
+    bool calcChaseYieldVelocity(double &vx, double &vy, double &vtheta, double minBallRange = 0.8,
+                                double rSep = 1.2, double speed = 0.8, double headingRad = 1e9);
+
+    /**
+     * @brief 贴身脱离兜底（2026-11-16）。行为树 tick 之后调用，压过本拍任何节点的速度。
+     * 与队友距离 < 0.40 m 持续 0.6 s 时，由 player_id 大者沿「背离队友 ∪ 远离球」的角平分线后退 1 s。
+     * 只在 control_state==3、非 go_manual、gc_game_state==PLAY 时接管。
+     * @return bool, true=已下发脱离速度
+     */
+    bool applySeparationBackoff();
+
+    /**
+     * @brief 起脚前队友门：最近存活队友是否挡在出球方向（kickDir）的扇形内。
+     *
+     * 实测（2026-11-12，39/45 双前锋）：一台 adjust 超时兜底强行起脚时，另一台距其 0.41 m，
+     * Kick / RLVisionKick 全程没有任何队友判据，球直接从队友身上过。判据取「我→队友」方位
+     * 与 kickDir 的夹角：夹角小说明队友站在我出球的那条线上。
+     * 调用方应据此把 decision 从 kick 降级为 adjust（由 Adjust 先侧移让开）。
+     *
+     * @param clearDist double, 队友距离小于该值算挡路（默认 0.8）
+     * @param coneRad double, 出球方向两侧的判定半角（默认 1.05 rad ≈ 60°）
+     * @param outIdx int*, 可选输出：最近队友下标
+     * @param outDist double*, 可选输出：最近队友距离
+     * @return bool, true = 有队友挡在出球方向上
+     */
+    bool isTeammateBlockingKick(double clearDist = 0.8, double coneRad = 1.05, int *outIdx = nullptr, double *outDist = nullptr);
 
 
     /**

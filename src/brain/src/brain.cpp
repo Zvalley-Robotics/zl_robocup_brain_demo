@@ -569,6 +569,12 @@ void Brain::tick()
     // 头部指令收口（2026-11-17）：本拍所有节点的 requestHead 在这里仲裁后只下发一次。
     // 必须放在 tree->tick() 之后：请求是行为树节点产生的，早于它的位置拿到的都是上一拍请求。
     client->flushHead();
+
+    // 贴身脱离兜底：放在行为树之后，压过本拍任何节点下发的速度
+    applySeparationBackoff();
+    // 指令-位移一致性观测（只报警不改速度）
+    client->checkStuck();
+
     // 上报本 tick 实际执行的行为树策略链（UI 展示用；变更时发布 + 2s 心跳）
     publishBrainStrategy();
 }
@@ -2806,43 +2812,85 @@ bool Brain::calcTeammateSeparationVelocity(double &vx, double &vy, double &vthet
             sepDY = dy;
         }
     }
-    if (sepDist >= rSep) return false;
+    // 让位滞回：让开后要多拉开 0.3 m 才恢复，避免在触发距离上“贴近-让开”来回抖
+    // （2026-11-12，提前量从 0.7 抬到 1.2 后尤其需要）
+    static bool yielding = false;
+    const double rSepEff = yielding ? rSep + 0.3 : rSep;
+    if (sepDist >= rSepEff) {
+        yielding = false;
+        return false;
+    }
+
+    // 方向判据（可选）：只对“挡在我行进方向上（±70°）”的队友让位。
+    // 只看距离时，接应前锋在站位点侧边 1.1 m 有队友就会不停让开→回去→再让开；
+    // 贴身（≤ 0.5 m）时无论方向一律让。
+    if (headingRad < 1e8 && sepDist > 0.5) {
+        const double toTmAngle = atan2(-sepDY, -sepDX);   // 我 → 队友
+        if (fabs(toPInPI(toTmAngle - headingRad)) > 1.22) {
+            yielding = false;
+            return false;
+        }
+    }
 
     double dirX = sepDX, dirY = sepDY;
     if (sepDist < 0.05) { // 位置几乎重合，无法定向，按球在场地哪一侧决定退让方向
         dirX = ballPos.y > 0 ? -1.0 : 1.0;
         dirY = 0.0;
     }
-    if (distToBorder() > - 1.0) { // 已贴边，改沿切线退开，避免被顶出场外
-        double txDir = -dirY, tyDir = dirX;
-        if (txDir * robotPose.x + tyDir * robotPose.y > 0) {
-            txDir = -txDir;
-            tyDir = -tyDir;
-        }
-        dirX = txDir;
-        dirY = tyDir;
+    {
+        double n = norm(dirX, dirY);
+        if (n < 1e-6) { dirX = 1.0; dirY = 0.0; n = 1.0; }
+        dirX /= n; dirY /= n;
     }
+
+    // 侧向切出：沿「队友→我」背离直退时双方互顶、谁也让不开（实测机身重叠 1.2 s、最近
+    // 0.03 m）。改为沿队友连线垂线切出，选“切出 0.6 m 后离球更远”的一侧；贴边换侧，两侧
+    // 都贴边才退回背离方向并降速。
+    double cutX = -dirY, cutY = dirX;
+    double altX = dirY, altY = -dirX;
+    constexpr double PROBE_M = 0.6;   // 选边用的前瞻距离
+    auto ballDistAfter = [&](double cx, double cy) {
+        return norm(robotPose.x + cx * PROBE_M - ballPos.x, robotPose.y + cy * PROBE_M - ballPos.y);
+    };
+    if (ballDistAfter(altX, altY) > ballDistAfter(cutX, cutY)) {
+        cutX = altX;
+        cutY = altY;
+    }
+    auto borderClearance = [&](double x, double y) {
+        auto fd = config->fieldDimensions;
+        return min(fd.length / 2.0 - fabs(x), fd.width / 2.0 - fabs(y));
+    };
+    const double clearanceNow = borderClearance(robotPose.x, robotPose.y);
+    if (borderClearance(robotPose.x + cutX * PROBE_M, robotPose.y + cutY * PROBE_M) < clearanceNow - 0.05) {
+        if (borderClearance(robotPose.x - cutX * PROBE_M, robotPose.y - cutY * PROBE_M) >= clearanceNow - 0.05) {
+            cutX = -cutX;   // 换到指向场内的那一侧
+            cutY = -cutY;
+        } else {
+            cutX = dirX;    // 两侧都会出界：退回背离方向，降速分开
+            cutY = dirY;
+            speed = min(speed, 0.3);
+        }
+    }
+
     Pose2D sepDir;
-    sepDir.x = dirX;
-    sepDir.y = dirY;
+    sepDir.x = cutX;
+    sepDir.y = cutY;
     sepDir.theta = 0;
     auto sepDir_r = data->field2robot(sepDir);
     double sepNorm = norm(sepDir_r.x, sepDir_r.y);
+    if (sepNorm < 1e-6) return false;
     vx = speed * sepDir_r.x / sepNorm;
     vy = speed * sepDir_r.y / sepNorm;
     vtheta = data->ball.yawToRobot * 4.0;
-    log->debug("TeammateSeparation", format("teammate too close (%.2f m), yield vx: %.2f vy: %.2f", sepDist, vx, vy));
+    yielding = true;
+    log->debug("TeammateSeparation", format("teammate too close (%.2f m), cut-out vx: %.2f vy: %.2f speed: %.2f", sepDist, vx, vy, speed));
     return true;
 }
 
-bool Brain::calcChaseYieldVelocity(double &vx, double &vy, double &vtheta, double minBallRange) {
-    // 追球/绕球阶段（Chase、Adjust）的单侧队友让位。与 Assist 的直接让位不同：
-    // Chase 里两台同时判 lead 的瞬态会同时冲向同一球后点，如果两边都无条件退开，
-    // 会变成互相退让、球无人跟；这里先用 (cost, player_id) 仲裁决定谁让：
-    //   对方明显更省（差 > 0.1）或同档内 id 更小 → 我退，对方不退，因此不会双退。
-    // 球已进入踢球距离时不退，避免把正在起脚/绕球对准的一台拽离球。
-    if (data->ball.range < minBallRange) return false;
-
+bool Brain::calcChaseYieldVelocity(double &vx, double &vy, double &vtheta, double minBallRange, double rSep, double speed, double headingRad) {
+    // Chase/Adjust 的单侧让位与 Assist 不同：先仲裁谁让，同一时刻只有一台在退（否则球无人
+    // 跟）。距离 < HARD_YIELD_DIST 时不看 cost、按 player_id 大者退——两机比的是不同时刻的
+    // cost，相差一档时结论不互补，可同时判“我不退”；≥ 门限仍按 (cost, player_id)。
     auto robotPose = data->robotPoseToField;
     int selfIdx = config->get_player_id() - 1;
     double sepDist = 1e9;
@@ -2857,33 +2905,176 @@ bool Brain::calcChaseYieldVelocity(double &vx, double &vy, double &vtheta, doubl
             nearIdx = i;
         }
     }
-    if (nearIdx < 0 || sepDist >= 0.7) return false;
+    if (nearIdx < 0 || sepDist >= rSep) return false;
 
     auto &nearTm = data->tmStatus[nearIdx];
+    constexpr double HARD_YIELD_DIST = 0.5;   // 低于该距离必然有一方退（不看 cost）
+    const bool hardGate = (sepDist < HARD_YIELD_DIST);
+
     bool iYield = (nearTm.role == "goal_keeper"); // 门将有优先权，贴身时直接让
     if (!iYield) {
-        constexpr double YIELD_DEADBAND = 0.1;
-        if (nearTm.cost < data->tmMyCost - YIELD_DEADBAND) iYield = true;
-        else if (fabs(nearTm.cost - data->tmMyCost) <= YIELD_DEADBAND) iYield = (nearIdx + 1) > config->get_player_id();
+        if (hardGate) {
+            iYield = (nearIdx + 1) > config->get_player_id();
+        } else {
+            constexpr double YIELD_DEADBAND = 0.1;
+            if (nearTm.cost < data->tmMyCost - YIELD_DEADBAND) iYield = true;
+            else if (fabs(nearTm.cost - data->tmMyCost) <= YIELD_DEADBAND) iYield = (nearIdx + 1) > config->get_player_id();
+        }
     }
     if (!iYield) return false;
 
-    if (!calcTeammateSeparationVelocity(vx, vy, vtheta, 0.7, 0.4)) return false;
+    // 球已在踢球窗内：只在硬门限（已贴身）时干预
+    if (!hardGate && data->ball.range < minBallRange) return false;
+
+    if (!calcTeammateSeparationVelocity(vx, vy, vtheta, rSep, speed, headingRad)) return false;
     // 1 Hz INFO：实机上 debug 级日志默认不落 stdout（/tmp/brain.log 里看不到），
     // 需要一条能直接查的让位证据。判据：双机贴身时只有较差的那台打印 yield。
     static rclcpp::Time lastYieldLog = get_clock()->now();
+    static double prevSep = -1.0;
     if (msecsSince(lastYieldLog) > 1000) {
         lastYieldLog = get_clock()->now();
-        RCLCPP_INFO(get_logger(), "[yield] yield to P%d sep=%.2f m ball=%.2f m tmCost=%.1f myCost=%.1f",
-            nearIdx + 1, sepDist, data->ball.range, nearTm.cost, data->tmMyCost);
+        // prev 与 dir 用于判断切出方向到底有没有把距离拉开（2026-11-16 贴身 58 s 取证）
+        RCLCPP_INFO(get_logger(), "[yield] yield to P%d sep=%.2f prev=%.2f ball=%.2f m tmCost=%.1f myCost=%.1f hard=%d dir=%.0f vx=%.2f vy=%.2f",
+            nearIdx + 1, sepDist, prevSep, data->ball.range, nearTm.cost, data->tmMyCost, hardGate ? 1 : 0,
+            rad2deg(atan2(vy, vx)), vx, vy);
+        prevSep = sepDist;
     }
-    log->debug("TeammateSeparation", format("yield in chase (sep %.2f m, ball %.2f m, tmCost %.1f, myCost %.1f)",
-        sepDist, data->ball.range, nearTm.cost, data->tmMyCost));
+    log->debug("TeammateSeparation", format("yield in chase (sep %.2f m, ball %.2f m, tmCost %.1f, myCost %.1f, hard %d)",
+        sepDist, data->ball.range, nearTm.cost, data->tmMyCost, hardGate ? 1 : 0));
     return true;
 }
 
+bool Brain::applySeparationBackoff() {
+    constexpr double ENTER_DIST = 0.80;   // 触发距离（2026-11-17 提速 2×：0.55→0.80，接近速度翻倍）
+    constexpr double OVERLAP_DIST = 0.45; // 真重叠：此时即使在起脚也强行分开
+    constexpr double EXIT_DIST = 1.10;    // 退出距离（滞回，防止退一步又贴回）
+    constexpr double HOLD_MS = 600.0;
+    constexpr double ACT_MS = 1000.0;
+    constexpr double SPEED = 0.45;
 
-// ------------------------------------------------------ Debug log related ------------------------------------------------------
+    // 只接管自动策略与正式比赛：人工接力不覆盖，END 按规则停住
+    if (tree->getEntry<int>("control_state") != 3) return false;
+    if (tree->getEntry<bool>("go_manual")) return false;
+    if (tree->getEntry<string>("gc_game_state") != "PLAY") return false;
+
+    static bool backing = false;
+    static double closeMs = 0.0; // 过近累计（衰减式）：允许贴身时距离在门限上下抖动
+    static rclcpp::Time backoffStart = get_clock()->now();
+    static rclcpp::Time lastTick = get_clock()->now();
+    const auto now = get_clock()->now();
+    double dtMs = (now - lastTick).seconds() * 1000.0;
+    lastTick = now;
+    if (dtMs <= 0.0 || dtMs > 2000.0) dtMs = 0.0; // 首拍/时间跳变不参与累计
+
+    const auto robotPose = data->robotPoseToField;
+    const int selfId = config->get_player_id();
+    const int selfIdx = selfId - 1;
+    double sepDist = 1e9;
+    int nearIdx = -1;
+    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+        if (i == selfIdx) continue;
+        auto &tm = data->tmStatus[i];
+        if (!tm.isAlive || msecsSince(tm.timeLastCom) > 1000) continue;
+        if (!std::isfinite(tm.robotPoseToField.x) || !std::isfinite(tm.robotPoseToField.y)) continue;
+        const double d = norm(robotPose.x - tm.robotPoseToField.x, robotPose.y - tm.robotPoseToField.y);
+        if (d < sepDist) { sepDist = d; nearIdx = i; }
+    }
+    if (nearIdx < 0) { closeMs = 0.0; backing = false; return false; }
+
+    if (sepDist < ENTER_DIST) closeMs += dtMs;
+    else closeMs = max(0.0, closeMs - dtMs * 0.5);
+
+    if (backing && (sepDist >= EXIT_DIST || msecsSince(backoffStart) > ACT_MS)) backing = false;
+    if (!backing) {
+        if (closeMs < HOLD_MS) return false;
+        // 小 id（通常是门将）不退，只等对方退；同一时刻只有一台在退
+        if (selfId < nearIdx + 1) return false;
+        // 起脚优先，只有真重叠才打断
+        const string dec = tree->getEntry<string>("decision");
+        const bool kicking = (dec == "kick" || dec == "auto_visual_kick" || dec == "cross");
+        if (kicking && sepDist > OVERLAP_DIST) return false;
+        backing = true;
+        backoffStart = get_clock()->now();
+    }
+
+    // 方向：背离队友
+    double dirX = robotPose.x - data->tmStatus[nearIdx].robotPoseToField.x;
+    double dirY = robotPose.y - data->tmStatus[nearIdx].robotPoseToField.y;
+    double n = norm(dirX, dirY);
+    if (n < 1e-6) { dirX = 1.0; dirY = 0.0; n = 1.0; }
+    dirX /= n; dirY /= n;
+
+    const bool ballFresh = data->ballDetected && msecsSince(data->ball.timePoint) < kBallFreshMs &&
+                           std::isfinite(data->ball.posToField.x) && data->ball.range < 1e5;
+    if (ballFresh) {
+        // 与“远离球”方向取角平分：既离开队友，又不往球上压
+        double bx = robotPose.x - data->ball.posToField.x;
+        double by = robotPose.y - data->ball.posToField.y;
+        const double bn = norm(bx, by);
+        if (bn > 1e-6) {
+            const double sx = dirX + bx / bn;
+            const double sy = dirY + by / bn;
+            const double sn = norm(sx, sy);
+            if (sn > 0.3) { dirX = sx / sn; dirY = sy / sn; }
+        }
+    }
+
+    Pose2D dirF;
+    dirF.x = dirX; dirF.y = dirY; dirF.theta = 0;
+    const auto dirR = data->field2robot(dirF);
+    const double rn = norm(dirR.x, dirR.y);
+    if (rn < 1e-6) return false;
+    const double vx = SPEED * dirR.x / rn;
+    const double vy = SPEED * dirR.y / rn;
+    const double vtheta = ballFresh
+        ? cap(data->ball.yawToRobot * 4.0, config->get_vtheta_limit(), -config->get_vtheta_limit())
+        : 0.0;
+    client->setVelocity(vx, vy, vtheta);
+
+    static rclcpp::Time lastLog = get_clock()->now();
+    if (msecsSince(lastLog) > 1000) {
+        lastLog = get_clock()->now();
+        RCLCPP_WARN(get_logger(), "[separation] backoff from P%d sep=%.2f m ball=%d vx=%.2f vy=%.2f",
+                    nearIdx + 1, sepDist, ballFresh ? 1 : 0, vx, vy);
+    }
+    return true;
+}
+
+bool Brain::isTeammateBlockingKick(double clearDist, double coneRad, int *outIdx, double *outDist) {
+    // 起脚前队友门：队友站在「我→ kickDir」的扇形内时，踢出去的球会从它身上过
+    // （实测 39 在 45 距 0.41 m 时照常起脚）。这里只做判定，降级/侧移由调用方决定。
+    const int selfIdx = config->get_player_id() - 1;
+    const auto rp = data->robotPoseToField;
+    double nearest = 1e9;      // 最近队友（日志用）
+    double blockDist = 1e9;    // 最近“确实挡在出球方向扇形内”的队友
+    int blockIdx = -1;
+    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+        if (i == selfIdx) continue;
+        auto &tm = data->tmStatus[i];
+        if (!tm.isAlive) continue;
+        // 门将不算“挡路”：GK 通常就站在我踢向自家门的线后方，算上它会让门线解围永远不成立
+        // （GK 区清球分支要求 ball.range<1.0，本来就不应该被它拦住）。
+        if (tm.role == "goal_keeper") continue;
+        // 消息过期视为失联：不因为对面广播停了就把自己钉在原地不起脚
+        if (msecsSince(tm.timeLastCom) > 1000) continue;
+        const double dx = tm.robotPoseToField.x - rp.x;
+        const double dy = tm.robotPoseToField.y - rp.y;
+        const double d = norm(dx, dy);
+        if (d < nearest) nearest = d;
+        // 只统计真正落在出球扇形内的：最近队友在旁边（不在出球线上）时不能把它当成挡路
+        const double angle = fabs(toPInPI(atan2(dy, dx) - data->kickDir));
+        if (angle < coneRad && d < blockDist) {
+            blockDist = d;
+            blockIdx = i;
+        }
+    }
+    if (outIdx) *outIdx = blockIdx;
+    if (outDist) *outDist = blockIdx >= 0 ? blockDist : nearest;
+    return blockIdx >= 0 && blockDist < clearDist;
+}
+
+
+// ----- Debug log related -----
 void Brain::logLags() {
     
     double detLag = msecsSince(data->timeLastDet);
