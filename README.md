@@ -498,8 +498,8 @@ engine 与 TensorRT/CUDA/GPU 版本绑定。换 JetPack 或换机器后需重新
 
 ## 12. 已知限制
 
-- **TensorRT engine 不可跨机器直接复用。** 随包的 `det_261019_fp16.engine` /
-  `seg_261027_fp16.engine` 只保证在生成它们的软硬件组合上可加载。
+- **TensorRT engine 不可跨机器直接复用。** 随包的 `det_261112_fp16.engine` /
+  `seg_261112_fp16.engine` 只保证在生成它们的软硬件组合上可加载。
 - **仓库不附带 ONNX 模型。** x86/NO_CUDA 构建可以编译，但运行 vision 需要用户自备
   `.onnx` 文件。
 - **示例标定值不可直接用于新机器人。** `vision.yaml` 的相机内外参来自一台实机，

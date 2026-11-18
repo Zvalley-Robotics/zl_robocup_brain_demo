@@ -4,8 +4,8 @@
 
 | 文件 | 用途 | 说明 |
 |---|---|---|
-| `det_261019_fp16.engine` | 目标检测 | 输入 640×640；类别见 `vision.yaml` 的 `detection_model.classnames` |
-| `seg_261027_fp16.engine` | 场地线分割 | 输入 640×640；单类场地线模型（`field_line_class_id: -1`） |
+| `det_261112_fp16.engine` | 目标检测 | 输入 640×640；类别见 `vision.yaml` 的 `detection_model.classnames` |
+| `seg_261112_fp16.engine` | 场地线分割 | 输入 640×640；单类场地线模型（`field_line_class_id: -1`） |
 
 ## 重要限制
 

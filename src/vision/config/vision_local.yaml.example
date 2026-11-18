@@ -29,9 +29,9 @@ camera:
 # 模型路径可用相对路径（相对于 vision 包 share 目录，或当前工作目录），
 # 也建议直接用 launch 参数 detection_model_path / segmentation_model_path 覆盖。
 # detection_model:
-#   model_path: model/det_261019_fp16.engine
+#   model_path: model/det_261112_fp16.engine
 # segmentation_model:
-#   model_path: model/seg_261027_fp16.engine
+#   model_path: model/seg_261112_fp16.engine
 
 # 手眼标定结果（仅 aarch64 的 calibration_node 使用）。
 # calibration:

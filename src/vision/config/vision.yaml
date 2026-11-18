@@ -68,7 +68,7 @@ camera:
 detection_model:
   # 相对路径先按当前工作目录解析，找不到再到 vision 包 share 目录下解析；
   # 也可用 launch 参数 detection_model_path 覆盖（绝对路径最稳）。
-  model_path: model/det_261019_fp16.engine
+  model_path: model/det_261112_fp16.engine
   confidence_threshold: 0.2
   nms_threshold: 0.4
   classnames: [Ball, Goalpost, LCross, TCross, XCross, PenaltyPoint, Opponent, Person]
@@ -76,7 +76,7 @@ detection_model:
     single_ball_assumption: false
     confidence_thresholds:
       # Ball 沿用同事 2026-11-04 版取值；其余类别按本仓实测值。
-      Ball: 0.6
+      Ball: 0.75
       Goalpost: 0.2
       LCross: 0.4
       TCross: 0.4
@@ -85,10 +85,10 @@ detection_model:
       Opponent: 0.6
       Person: 0.6
 segmentation_model:
-  model_path: model/seg_261027_fp16.engine
+  model_path: model/seg_261112_fp16.engine
   confidence_threshold: 0.3
   nms_threshold: 0.9
-  # -1 = 不按类别过滤（seg_261027 单类模型）；
+  # -1 = 不按类别过滤（seg_261112 单类模型）；
   # 回退多类模型（football_20260701 / 仿真 sim_data_seg_0126）时改回 1。
   field_line_class_id: -1
 use_depth: true

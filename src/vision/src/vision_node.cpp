@@ -292,7 +292,7 @@ void VisionNode::Init(const std::string &cfg_template_path,
         std::cerr << "no segmentation model param found" << std::endl;
     } else {
         segmentor_ = YoloV8Segmentor::CreateYoloV8Segmentor(node["segmentation_model"], segmentation_model_path);
-        // -1 = 不按类别过滤（seg_261027 单类模型）；缺省 1 兼容 joint_test/仿真的多类 ONNX 模型。
+        // -1 = 不按类别过滤（seg_261112 单类模型）；缺省 1 兼容 joint_test/仿真的多类 ONNX 模型。
         field_line_class_id_ = as_or<int>(node["segmentation_model"]["field_line_class_id"], 1);
         if (field_line_class_id_ < -1) {
             throw std::runtime_error("segmentation_model.field_line_class_id must be >= -1 (-1 = accept all)");
@@ -948,7 +948,7 @@ void VisionNode::ProcessSegmentationData(SyncedDataBlock &synced_data, vision_in
     std::vector<SegmentationRes> field_line_segmentations;
     std::vector<FieldLineSegment> field_line_segs;
     for (auto &seg : segmentations) {
-        // 单类模型（seg_261027）配 -1 不过滤；多类模型由 field_line_class_id 指定类别。
+        // 单类模型（seg_261112）配 -1 不过滤；多类模型由 field_line_class_id 指定类别。
         if (field_line_class_id_ >= 0 && seg.class_id != field_line_class_id_) {
             continue;
         }
