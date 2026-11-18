@@ -121,6 +121,11 @@ public:
             // 2026-11-09：超时放行也要有速度上限（否则“持续滚动的球”会被无条件交棒，模型追不上）。
             InputPort<double>("handoff_ball_speed_relax_max", 0.80, "Relaxed ball-speed cap applied when the still-timeout fires; above this the handoff is still refused"),
             InputPort<double>("handoff_ball_still_timeout_ms", 1000.0, "Fallback: allow handoff after waiting this long for the ball to stop"),
+            // 模型自动瞄门（正向 180°）后方向对齐门限失效，改判“球/门都在机前锥内 + 瞄准目标有效”。
+            InputPort<double>("visual_kick_ball_front", 1.30, "Max |ball yaw| (rad) allowed at visual-kick handoff"),
+            InputPort<double>("visual_kick_goal_front", 1.40, "Max |kickDir - body heading| (rad) allowed at visual-kick handoff"),
+            InputPort<bool>("visual_kick_require_goal_target", true, "Require kick_targets (goal pose synthesis) to be publishing"),
+            InputPort<bool>("visual_kick_shoot_only", true, "Only hand off to visual kick when kickType == 'shoot'"),
             InputPort<string>("decision_in", "", "Used to read the previous decision"),
             InputPort<string>("position", "offense", "offense | defense, determines the direction to kick the ball"),
             OutputPort<string>("decision_out")};

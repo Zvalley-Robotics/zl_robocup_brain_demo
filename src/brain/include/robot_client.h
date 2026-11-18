@@ -47,6 +47,9 @@ public:
     /** 100Hz 驱动 zl 状态推进序列器与踢球交接状态机（由 Brain::tick 调用）。 */
     void tick();
 
+    /** 门位姿合成（kick_targets）是否在稳定发布；视觉踢交棒门用它确认模型瞄门输入有效。 */
+    bool kickTargetsActive() const;
+
     /**
      * @brief 头部位姿（相机光轴语义，弧度；内部转关节角并限幅）
      * @return int , 0 indicates success

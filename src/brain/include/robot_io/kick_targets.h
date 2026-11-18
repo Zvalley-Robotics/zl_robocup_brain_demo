@@ -39,6 +39,9 @@ public:
     double pose_x, double pose_y, double pose_theta, double pose_stamp_sec,
     const ZlIo::NavSnapshot & nav, double now_sec);
 
+  // 门位姿是否在稳定发布（供视觉踢交棒门；enable=false 时不拦，保持旧兜底行为）。
+  bool active(double now_sec) const;
+
 private:
   void publishTick(
     double pose_x, double pose_y, double pose_theta, const ZlIo::NavSnapshot & nav,

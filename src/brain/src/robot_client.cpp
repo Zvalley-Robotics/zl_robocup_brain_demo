@@ -660,7 +660,8 @@ double RobotClient::msecsToCollide(double vx, double vy, double vtheta, double m
     if (robots.size() == 0) return maxTime;
     if (vx < 1e-3 && vy < 1e-3) return maxTime;
 
-    // simplify the calculation by not considering vtheta for now. This is a conservative estimation.
+    // simplify the calculation by not considering vtheta for now. This is a
+    // conservative estimation.
     double x0 = brain->data->robotPoseToField.x;
     double y0 = brain->data->robotPoseToField.y;
     double robotTheta = brain->data->robotPoseToField.theta;

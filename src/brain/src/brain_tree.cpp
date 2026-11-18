@@ -23,10 +23,8 @@
         #Name,                     \
         [this](const string &name, const NodeConfig &config) { return make_unique<Name>(name, config, brain); });
 
-// 2026-11-05：球方位 → 角速度的跟踪增益。原为 SimpleChase / GoToGoalBlockingPosition /
-// Assist 三处硬编码 *4.0；3588 取消速度映射缩减后本体按下发值 1:1 执行，等效增益翻倍，
-// |yaw|>0.3 rad（17°）就顶到 vtheta_limit 满幅反向转。改为可配增益（默认 2.0 ≈ 提速前等效值）
-// 并加死区：死区内直接归零，避免 min_vtheta 抬升把近零方位误差放大成持续原地转。
+// 球方位 → 角速度的跟踪增益（可配）：3588 取消速度折半后本体按下发值 1:1 执行，等效增益
+// 翻倍，|yaw|>0.3 rad 就顶到 vtheta_limit 满幅反向转。死区内直接归零，避免 min_vtheta 抬升放大。
 static double yawTrackVtheta(Brain *brain, double yawToBall)
 {
     if (!std::isfinite(yawToBall)) return 0.0;
@@ -34,15 +32,9 @@ static double yawTrackVtheta(Brain *brain, double yawToBall)
     return yawToBall * brain->config->get_yaw_track_gain();
 }
 
-// 2026-11-06：纯 P 转向（vtheta = Kp*err）在执行滞后（步态 + 板端 0.05 平滑，约 100~200 ms）
-// 叠加 3588 取消速度折半后增益翻倍，工作点贴着极限环临界点：球静止时机器人绕球来回摆
-// （实测球位连续 157 帧不变，vx=vy=0 而 vtheta 在 ±1.20 反复换向）。
-// 补 D 项（阻尼）后 vtheta = Kp*err - Kd*omega_measured：omega 涨到 Kp*err/Kd 时输出归零，
-// 系统自动进入滑行段，不再一路打满转过冲。
-// 关键取舍：D 作用在"实测角速度"上而非误差差分——目标量（ballYaw / kickDir）跳变时
-// 不会产生微分尖峰，只抑制"已经转得太快"。
-// 角速度来源是 odom 的 atan2(yaw)（zl_io.cpp onOdom）：连续、不受定位重置影响，可安全差分。
-// yaw_track_damping=0 时整条通道退化为原纯 P 行为（回退开关）。
+// 纯 P 转向在步态 + 板端平滑（100~200 ms）滞后下会贴着极限环：球静止时机器人绕球来回摆。
+// 补 D 项作用在 odom 实测角速度上（非误差差分），目标量跳变不产生微分尖峰；
+// damping=0 时整条通道退化为原纯 P 行为（回退开关）。
 struct YawCtrlState
 {
     double lastTheta = 0.0;
@@ -145,6 +137,7 @@ void BrainTree::initEntry()
     // 球位置共享（2026-11-10）：hint 只给转头用；guard 在 LOCAL/TM 来源切换后的短窗内置真
     setEntry<bool>("tm_ball_pos_hint", false);
     setEntry<bool>("ball_src_guard", false);
+    setEntry<bool>("ball_self_suspect", false);
     setEntry<bool>("ball_out", false);
     setEntry<bool>("track_ball", true);
     // 当 ground_truth 启用时直接标定为已校准，SelfLocate 粒子滤波变为无害空操作
@@ -337,10 +330,8 @@ NodeStatus CamTrackBall::tick()
     // “看见球”= 本帧有检测且位置未过期。只看 ballDetected 会把“刚丢失一帧”
     // 也当成可见；只看 ball_location_known 则会在记忆期内一直信任旧位置。
     const double ballAgeMs = brain->msecsSince(brain->data->ball.timePoint);
-    // GT 球只有场地/机器人系坐标，没有视觉 boundingBox；若仍走下面的图像框分支，
-    // 会用未初始化的框（通常全 0）把 yaw/pitch 持续推到限位。GT 球改走相对角度分支
-    // （updateBallMemory 每 tick 已维护 pitchToRobot/yawToRobot）。
-    // 实机（gt ball 关闭）行为不变。
+    // GT 球没有视觉 boundingBox，走图像框分支会用未初始化的框把 yaw/pitch 推到限位，
+    // 故单走相对角度分支（updateBallMemory 已维护 pitchToRobot/yawToRobot）。实机行为不变。
     const bool gtBall = brain->config->get_gt_ball_enabled();
     bool iSeeBall = !gtBall && brain->data->ballDetected && ballAgeMs <= Brain::kBallFreshMs;
     bool iKnowBallPos = brain->tree->getEntry<bool>("ball_location_known");
@@ -352,11 +343,8 @@ NodeStatus CamTrackBall::tick()
     if (!(iKnowBallPos || tmBallPosReliable || tmBallPosHint))
         return NodeStatus::SUCCESS;
 
-    // 2026-10-30: 丢球宽限期按距离分段。
-    //   近距（<0.6 m，踢球/贴脚）：300 ms 就放弃，避免把头顶到脚边（range 小时
-    //   pitchToRobot 会被 asin 限幅到最低头）；
-    //   远距：放宽到 1500 ms，球短暂出框/被腿挡住时继续朝最后方向转头找，
-    //   不要立刻切 CamFindBall 的 6 点扫描。
+    // 丢球宽限期按距离分段：近距 <0.6 m 只留 300 ms（range 小时 pitchToRobot 被 asin 限幅
+    // 到最低头）；远距放宽到 1500 ms，球短暂出框/被腿挡住时继续朝最后方向找，不立刻切 6 点扫描。
     const double rangeForGrace = iKnowBallPos ? brain->data->ball.range : brain->data->tmBall.range;
     const double lostGraceMs = (rangeForGrace < 0.6) ? 300.0 : 1500.0;
     if (!iSeeBall && ballAgeMs > lostGraceMs)
@@ -678,11 +666,9 @@ NodeStatus GoToFreekickPosition::onRunning() {
        getInput("attack_dist", dist);
         
        if (brain->data->myStrikerIDRank == 0) {
-        // 理想站位点在球后 dist·(-kickDir)。判罚点贴底线/边线（角球）时该点会落到
-        // 场外；若按 x/y 硬夹进场内，站位会滑到球的斜前方——对齐角丢失后 PLAY 里
-        // reachedKickDir 永远不满足，只能落 Adjust 顶着贴线球绕，容易把球蹭出界。
-        // 这里沿“球→站位”射线收缩站位距离：机器人→球方位仍严格等于 kickDir
-        // （起脚对齐不丢），只把距离收进“场内留 0.05 m 边距”的可达范围。
+        // 判罚点贴底线/边线时球后站位点会落到场外；硬夹 x/y 会让站位滑到球的斜前方，对齐角
+        // 丢失后 reachedKickDir 永不满足。改为沿“球→站位”射线收缩距离——机器人→球方位仍严格
+        // 等于 kickDir，只把距离收进场内可达范围（留 0.05 m 边距）。
         double ux = cos(kickDir), uy = sin(kickDir);
         double dMax = dist;
         if (ux > 1e-9)       dMax = min(dMax, (ballPos.x + fd.length / 2.0 - 0.05) / ux);
@@ -725,10 +711,8 @@ NodeStatus GoToFreekickPosition::onRunning() {
             }
     }
 
-    // 判罚点靠近底线/边线时，“站到球后/挡在球与球门之间”的几何解会落到场外
-    // （最多可在球门线后数米），统一收进场内并留 0.3 m 边距，避免径直走出场；
-    // 主罚者站位已在上方沿 kickDir 收缩重解并保持在 0.05 m 边距内，跳过 clamp
-    // 以免再次破坏起脚对齐。
+    // 判罚点靠近底线/边线时，“站到球后/挡在球与球门之间”的几何解会落到场外，统一收进场内
+    // 并留 0.3 m 边距；主罚者站位已沿 kickDir 重解，跳过 clamp 以免再次破坏起脚对齐。
     if (!stanceAligned) {
         targetPose.x = cap(targetPose.x, fd.length / 2.0 - 0.3, - fd.length / 2.0 + 0.3);
         targetPose.y = cap(targetPose.y, fd.width / 2.0 - 0.3, - fd.width / 2.0 + 0.3);
@@ -1491,16 +1475,18 @@ NodeStatus StrikerDecide::tick() {
     getInput("handoff_ball_speed_max", handoffBallSpeedMax);
     getInput("handoff_ball_still_timeout_ms", handoffBallStillTimeoutMs);
     getInput("handoff_ball_speed_relax_max", handoffBallSpeedRelaxMax);
+    double visualBallFront, visualGoalFront;
+    bool visualNeedGoalTarget, visualShootOnly;
+    getInput("visual_kick_ball_front", visualBallFront);
+    getInput("visual_kick_goal_front", visualGoalFront);
+    getInput("visual_kick_require_goal_target", visualNeedGoalTarget);
+    getInput("visual_kick_shoot_only", visualShootOnly);
     string lastDecision, position;
     getInput("decision_in", lastDecision);
     getInput("position", position);
 
-    // --- 视觉踢退出冷却（R2，2026-10-31）--------------------------------
-    // 提前退出（ballTooFar / max_msec_kick）后若立刻允许再触发，会出现“两次踢球只隔
-    // 2~3 s”的连踢（实测：好回合 1.4~1.6 s 结束后 1.4~1.6 s 又进一次，第二发必坏）。
-    // 2026-10-31 二次调：2500 ms 仍拦不住“P3 秒退循环”（brain 侧球 0.5 m、adapter 侧 5.8 m
-    // 的球源不一致导致每次交接被秒退，2 s 一圈），抬到 5000 ms；
-    // 真正的根治在 vision 的 Ball 选球策略（见交接单），本条仅止血。
+    // 视觉踢退出冷却：提前退出后若立刻允许再触发，会“两次踢球只隔 2~3 s”且第二发必坏。
+    // 2500 ms 拦不住“P3 秒退循环”，抬到 5000 ms；根治在 vision 的 Ball 选球策略，本条仅止血。
     constexpr double VISUAL_KICK_COOLDOWN_MS = 5000.0;
     static bool wasInVisualKick = false;
     static rclcpp::Time lastVisualKickEnd;
@@ -1514,11 +1500,9 @@ NodeStatus StrikerDecide::tick() {
         lastVisualKickEnd.nanoseconds() > 0 &&
         brain->msecsSince(lastVisualKickEnd) < VISUAL_KICK_COOLDOWN_MS;
 
-    // --- 交棒前置：球必须是“刚被检测到”，不能是跟踪预测的保持值（R1）---------
-    // 实机 14:29 那轮 4 个回合里有 3 个在交棒后 adapter 侧几乎看不见球（可见拍 3%~26%），
-    // 模型只能拿零阶保持的旧球位原地迈步 3~5 s（角速度冲到 4.4 rad/s，表现为踢完要摔）。
-    // 这里要求最近 200 ms 内每一拍都拿到新鲜检测（ballDetected 且 ballAge<=200 ms），
-    // 否则不交棒，让 chase/adjust 继续跟到稳定可见为止。
+    // 交棒前置：球必须“刚被检测到”，不能用跟踪预测的保持值——实机有 3/4 回合交棒后 adapter
+    // 可见拍只有 3%~26%，模型拿零阶保持的旧球位原地迈步 3~5 s（角速度冲到 4.4 rad/s，踢完要摔）。
+    // 要求最近 200 ms 内每拍都有新鲜检测，否则不交棒。
     constexpr double BALL_FRESH_MS = 200.0;
     static bool ballStaleInit = false;
     static rclcpp::Time lastBallStale;
@@ -1533,19 +1517,9 @@ NodeStatus StrikerDecide::tick() {
     const bool ballFreshForHandoff =
         brain->msecsSince(lastBallStale) >= BALL_FRESH_MS;
 
-    // --- 球速估计：交棒要求球已基本静止（2026-11-06）-------------------------
-    // 现象（实机）：Chase 冲进 <0.45 → 行走踢推球（球获 0.5~0.8 m/s 初速）→ 球刚滚到
-    // 0.6~0.9 且方位恰好对着 kickDir → 立刻交棒；切模型要 0.5 s，期间球再滚出 zl 侧
-    // t4_kicking 的 KICK_ESCAPE_M=1.2 → 回合 0.97 s 秒退；随后 5 s 冷却只能再推一次，
-    // 形成“推一下→踢一下→秒退”的怪异循环。实测：交棒后 1 s 球位移 >1 m 的 5 次里 3 次
-    // 秒退，而 <0.5 m 的 26 次里 0 次。t4_kicking 本质是“走向静止球、在球心外 0.35 m
-    // 起脚”的定点动作，追着滚动的球交棒必然失败，所以交棒前要求球速低于阈值。
-    // 估计方法（修正：2026-11-06 实机回测后）：用 200 ms 窗口的“端点位移 / 窗口时长”，
-    // 不用相邻帧差分。相邻帧差分（dt≈20 ms）会把 ±3 cm 的球位检测噪声放大成 1.5 m/s
-    // 的假速度——实测日志 ballSpeed 均值 0.78、100% 走 1 s 超时兜底，而同一时刻用
-    // 200 ms 端点差分只有中位 0.23 m/s（13/17 次 <0.35），且“交棒后 1 s 球位移”
-    // 中位仅 0.11 m，证明球确实静止。零阶保持帧不会入选（窗口取第一个/最后一个
-    // 不同位置）。超 5 m/s 的窗口跳过（检测跳变），丢球 >0.5 s 重置。
+    // 球速估计：交棒要求球已基本静止。用 200 ms 窗口的“端点位移 / 时长”，不用相邻帧差分
+    // （dt≈20 ms 会把 ±3 cm 检测噪声放大成 1.5 m/s 假速度）。>5 m/s 窗口跳过（检测跳变），
+    // 丢球 >0.5 s 重置，零阶保持帧不入窗口。
     static bool ballPosInit = false;
     static double ballRefStampSec = 0.0;
     static double ballRefX = 0.0, ballRefY = 0.0;
@@ -1587,11 +1561,9 @@ NodeStatus StrikerDecide::tick() {
     static bool wasInAdjust = false;
     static rclcpp::Time adjustStart;
 
-    // 视觉踢进行中：锁存 decision，不再每拍重算。
-    // zl 侧 t4_kicking（2026-10-30 版）接管后会自己转身、走向球，球距/球方位角/机身朝向
-    // 都会越出下面的触发窗；若继续每拍重算，RLVisionKick 的 _while 会判假把节点中途 halt，
-    // 表现为“刚切模型就停”/“踢一半回行走”。退出由 RLVisionKick 自己负责：shouldExit 与
-    // onHalted 两条路径都会清 tmImInVisualKick，清掉后这里立刻恢复逐拍决策。
+    // 视觉踢进行中锁存 decision，不每拍重算：t4_kicking 接管后会自己转身走向球，触发窗条件
+    // 必然失效，RLVisionKick 的 _while 判假会中途 halt（表现为“刚切模型就停”）。
+    // 退出由 RLVisionKick 的 shouldExit / onHalted 清 tmImInVisualKick 后恢复逐拍决策。
     if (brain->data->tmImInVisualKick) {
         wasInAdjust = false;
         setOutput("decision_out", "auto_visual_kick");
@@ -1623,26 +1595,22 @@ NodeStatus StrikerDecide::tick() {
     const double KICK_BODY_ALIGN = kickBodyAlign;
     const bool bodyAlignedForKick =
         fabs(toPInPI(kickDir - brain->data->robotPoseToField.theta)) < KICK_BODY_ALIGN;
-    // 出球方向门限（2026-10-31）：视觉踢交出去之后，zl 侧 t4_kicking 已删掉“绕到球后 →
-    // 到位转向门”的内部对准，只按“走向球、停在球心外 0.35 m、始终面向球”走位并起脚，
-    // 出球方向 ≈ 交接瞬间“机器人→球”的方位。所以必须在 brain 侧先把自己摆到球后 kickDir
-    // 线上，否则斜着进场就会把球踢偏。判据用 kickDir 而非门柱角，cross/block 两种踢法同样适用。
-    // 0.22 rad ≈ 12.6°：比行走击球的 reachedKickDir（0.1）松，便于由 adjust 收敛到位后放行。
-    // 注意（2026-10-31 实测回退）：曾试过“≤0.5 m 时放宽到 0.40”，结果放进了一批“球已在
-    // 0.32~0.37 m、一交棒就进相机盲区”的回合（adapter 侧可见拍只有 3%~26%，原地迈步 3~5 s）。
-    // 近距要的是“站到球后”而不是放松，所以恢复统一 0.22。
-    // 2026-11-06：改为由 XML kick_dir_align 传入（默认仍 0.22），现场放宽到 0.28~0.30
-    // 不必再重编；但注意放宽直接换成射门偏角：0.30 rad 在 3 m 处横向偏约 0.93 m。
+    // 出球方向门限：t4_kicking 已删掉内部对准，出球方向 ≈ 交接瞬间“机器人→球”的方位，
+    // 必须在 brain 侧先摆到球后 kickDir 线上。0.22 rad≈12.6°，比行走击球的 reachedKickDir(0.1)
+    // 松；近距曾放宽到 0.40，结果放进一批“一交棒即进相机盲区”的回合，已回退。
     const double KICK_DIR_ALIGN = kickDirAlign;
     const bool dirAlignedForKick = fabs(deltaDir) < KICK_DIR_ALIGN;
 
-    // 球静止判定（2026-11-06，2026-11-09 补放宽上限）：阈值与超时由 XML 的
-    // handoff_ball_speed_max / handoff_ball_still_timeout_ms 控制。
-    // 超时存在的目的是“球被对手推着走时不要永远不交棒”；但**无条件**超时放行会交出
-    // 正在快速滚动的球（实测 11-09 场 6 次轻踢里有 3 次交棒球速 1.02 / 1.29 / 3.29 m/s
-    // 全部是超时放行），模型启动后球已跑远，只能蹭到 0.6~0.9 m 或被 adapter 的
-    // KICK_ESCAPE_M=1.2 直接收尾。所以超时后仍需 ballSpeed < handoff_ball_speed_relax_max
-    // （0.8 m/s）：超时的作用是“放宽”而不是“取消”门限。
+    // 模型自动瞄门并绕到球背门侧对齐点，方向对齐不再是出球精度门，改判可达性。
+    const bool ballInFrontCone = fabs(ball.yawToRobot) < visualBallFront;
+    const bool goalInFrontCone =
+        fabs(toPInPI(kickDir - brain->data->robotPoseToField.theta)) < visualGoalFront;
+    const bool goalTargetOk = !visualNeedGoalTarget || brain->client->kickTargetsActive();
+    const bool shootOnlyOk = !visualShootOnly || brain->data->kickType == "shoot";
+
+    // 球静止判定：超时（handoff_ball_still_timeout_ms）的目的是“球被对手推着走时不要永远
+    // 不交棒”，但无条件放行会交出快速滚动的球（实测 6 次轻踢里 3 次是超时放行的 1~3.3 m/s），
+    // 故超时后仍要求 ballSpeed < handoff_ball_speed_relax_max——超时是“放宽”不是“取消”。
     static bool ballStillWaiting = false;
     static rclcpp::Time ballStillStart;
     const bool ballStill = ballSpeedEst < handoffBallSpeedMax;
@@ -1659,19 +1627,16 @@ NodeStatus StrikerDecide::tick() {
         ballStillWaiting && brain->msecsSince(ballStillStart) > handoffBallStillTimeoutMs;
     const bool ballStillReady = ballStill || (ballStillTimedOut && ballSlowEnoughRelaxed);
 
-    // --- adjust 兜底计时（2026-11-06）------------------------------------
-    // 下面的 kick 分支新增了“球距 ≥ kick_range_min 时不允许行走踢抢跑”的门控：
-    // 窗内（0.4~1.0）的拍子必须留给 Adjust 绕位，否则 Kick 一旦 RUNNING 就会冻结
-    // 本节点 1~4.8 s，窗口机会全部流失（实测 11-05 第二段 60 个合格拍就是这么被吞的）。
-    // 但贴线球/球位抖动可能让 dirAlign 永远收敛不了，所以必须留兜底：连续 adjust
-    // 超过 kick_force_msec 就放行行走踢（此时仍要求 bodyAlignedForKick，不会侧身推球）。
-    // 状态变量 wasInAdjust / adjustStart 已在视觉踢早退之前声明。
+    // adjust 兜底计时：窗内（0.4~1.0）的拍子留给 Adjust 绕位，否则 Kick 一 RUNNING 就冻结本
+    // 节点 1~4.8 s、窗口机会全部流失；贴线球让 dirAlign 永不收敛时按 kick_force_msec 放行行走踢
+    // （仍要求 bodyAlignedForKick，不会侧身推球）。
     const bool adjustTimedOut =
         wasInAdjust && brain->msecsSince(adjustStart) > kickForceMsec;
 
-    log(format("ballRange: %.2f, ballYaw: %.2f, ballX:%.2f, ballY: %.2f kickDir: %.2f, dir_rb_f: %.2f, angleGoodForKick: %d, dirAlign: %d, bodyAlign: %d, fresh: %d, cooling: %d",
-        ballRange, ballYaw, ballX, ballY, kickDir, dir_rb_f, angleGoodForKick,
-        dirAlignedForKick, bodyAlignedForKick, ballFreshForHandoff, visualKickCooling));
+    log(format("ballRange: %.2f, ballYaw: %.2f, ballX:%.2f, ballY: %.2f kickDir: %.2f, dir_rb_f: %.2f, deltaDir: %.2f, angleGoodForKick: %d, dirAlign: %d, bodyAlign: %d, ballFront: %d, goalFront: %d, fresh: %d, cooling: %d",
+        ballRange, ballYaw, ballX, ballY, kickDir, dir_rb_f, deltaDir, angleGoodForKick,
+        dirAlignedForKick, bodyAlignedForKick, ballInFrontCone, goalInFrontCone,
+        ballFreshForHandoff, visualKickCooling));
     auto dt = brain->msecsSince(timeLastTick);
     bool reachedKickDir = 
         deltaDir * lastDeltaDir <= 0 
@@ -1718,7 +1683,8 @@ NodeStatus StrikerDecide::tick() {
         && fabs(brain->data->ball.yawToRobot) < M_PI / 2.
         && !avoidKick
         && ball.range < 1.5
-        && !ballSrcGuard;
+        && !ballSrcGuard
+        && !kickHeldByTeammate;
     // GK 管辖区（与 GoalieDecide 后场线一致：球 x < -L/2+penaltyAreaLength+1.0，成年场 x<-3.0）：
     // 球进入自家后场后由 GK 负责清球，前锋（含 lead）不再上抢——只在已贴身（range<1.0）可踢时
     // 顺路把球踢出（清球），否则转 assist 退到中场接应，避免"门将和前锋都去追球"把全队吸回门前。
@@ -1735,19 +1701,19 @@ NodeStatus StrikerDecide::tick() {
                 !brain->tree->getEntry<bool>("ball_out") && 
                 brain->data->lose_ball == false &&
                 brain->data->tmMyCost < 7.0 &&
-                // 摆位与朝向必须先对准 kickDir：模型内部不再做绕球/转向门修正，
-                // 交接时斜着进来就会斜着出球（未对准时落到 adjust 分支继续绕球摆位）。
-                // 另外：球必须刚被检测到（fresh）且不在踢后冷却期（cooling），
-                // 否则会交出“盲踢”回合 / 连续两次踢球。
-                dirAlignedForKick &&
-                bodyAlignedForKick &&
+                // 球/门都在机前锥内 + 瞄准目标有效 + 仅射门场景交棒（模型只朝门踢）。
+                ballInFrontCone &&
+                goalInFrontCone &&
+                goalTargetOk &&
+                shootOnlyOk &&
                 ballFreshForHandoff &&
+                // 队友挡在出球方向时不交棒（交出去模型会径直走向球并从队友身上过）
+                !kickHeldByTeammate &&
                 // 球已基本静止才交棒：t4_kicking 追滚动的球必被 zl 侧 ESCAPE 收尾（<1 s 秒退）。
                 ballStillReady &&
                 !visualKickCooling &&
                 brain->data->ball.range < brain->config->get_auto_visual_kick_enable_dist_max() &&
                 brain->data->ball.range > brain->config->get_auto_visual_kick_enable_dist_min() &&
-                fabs(brain->data->ball.yawToRobot) < brain->config->get_auto_visual_kick_enable_angle() * 1.3 &&
                 brain->data->ball.posToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
                 fabs(brain->data->ball.posToField.y) < 5 &&
                 brain->data->robotPoseToField.x > brain->config->fieldDimensions.length / 2 - 14.3 &&
@@ -1797,12 +1763,11 @@ NodeStatus StrikerDecide::tick() {
         && !avoidKick
         && bodyAlignedForKick
         && !ballSrcGuard
+        && !kickHeldByTeammate
         && ball.range < 1.5
-        // 2026-11-06：行走踢不得抢跑。Kick 分支原本只要求 bodyAlign + range<1.5，
-        // 没有 dirAlign 也没有距离下限，于是“球距还在视觉踢窗口内、只是方位没对上”
-        // 的拍子会立刻转 kick；Kick 一 RUNNING 就冻结 StrikerDecide 1~4.8 s，窗口
-        // 机会全部流失。现在球距 ≥ kick_range_min 时强制留在 adjust 绕位，直到对准
-        // 或兜底超时（kick_force_msec）。kick_range_min=0 时退回旧行为。
+        // 行走踢不得抢跑：Kick 分支无 dirAlign 也无距离下限时，“球距还在视觉踢窗口内、只是方位
+        // 没对上”的拍子会立刻转 kick，一 RUNNING 就冻结本节点 1~4.8 s。故 range ≥ kick_range_min
+        // 时强制留在 adjust 绕位，直到对准或兜底超时；kick_range_min=0 退回旧行为。
         && (ball.range < kickRangeMin || adjustTimedOut)
     ) {
         if (brain->data->kickType == "cross") newDecision = "cross";
@@ -1845,8 +1810,9 @@ NodeStatus StrikerDecide::tick() {
     if (newDecision == "auto_visual_kick" && lastDecision != "auto_visual_kick") {
         brain->log->log(
             "striker_decide",
-            format("visual kick handoff: ballRange=%.2f ballAge=%.0fms dirAlign=%d bodyAlign=%d fresh=%d ballSpeed=%.2f still=%d stillReady=%d relaxOK=%d cooling=%d cost=%.1f window=[%.2f,%.2f]",
-                   ballRange, ballAgeMs, dirAlignedForKick, bodyAlignedForKick,
+            format("visual kick handoff: ballRange=%.2f ballAge=%.0fms deltaDir=%.2f ballYaw=%.2f ballFront=%d goalFront=%d target=%d shootOnly=%d fresh=%d ballSpeed=%.2f still=%d stillReady=%d relaxOK=%d cooling=%d cost=%.1f window=[%.2f,%.2f]",
+                   ballRange, ballAgeMs, deltaDir, ballYaw, ballInFrontCone, goalInFrontCone,
+                   goalTargetOk, shootOnlyOk,
                    ballFreshForHandoff, ballSpeedEst, ballStill, ballStillReady,
                    ballSlowEnoughRelaxed, visualKickCooling,
                    brain->data->tmMyCost,
@@ -2090,17 +2056,45 @@ tuple<double, double, double> Kick::_calcSpeed() {
 
 double Kick::_alignVtheta(double ballYaw)
 {
-    // 行走击球的出球方向 = 机身朝向，而 Kick 期间原实现冻结 vtheta（纯平移），
-    // 会把球从身体侧前方推出去，表现为“侧身踢”。这里补两层：
-    //   1) 球不在正前锥内：先转球（与守门员分支同一控制律）；
-    //   2) 球在正前锥内：让机身对准本次出球方向 kickDir（场地系），边推边转正。
-    const double BALL_FRONT_CONE = 0.35;  // rad ≈ 20°
-    const double VT_LIMIT = 0.8;          // rad/s
+    // 行走击球的出球方向 = 机身朝向：球不在正前锥内先转球；在正前锥内让机身对准 kickDir。
+    // 转向取 PD（D 作用在 odom 实测角速度上）：纯 P + 执行滞后会 vθ 左右摆 → ballYaw 穿零 →
+    // crabWalk 按 sin(ballYaw) 分解出左右翻转的 vy。两分支目标量不同，各用独立 YawCtrlState。
+    constexpr double BALL_FRONT_CONE = 0.35;  // rad ≈ 20°
+    constexpr double VT_LIMIT = 0.8;          // rad/s
+    constexpr double VT_GAIN = 1.5;
+    static YawCtrlState stKickBall;
+    static YawCtrlState stKickDir;
     if (fabs(ballYaw) > BALL_FRONT_CONE) {
-        return cap(ballYaw * 1.5, VT_LIMIT, -VT_LIMIT);
+        return yawControl(brain, ballYaw, stKickBall, VT_LIMIT, VT_GAIN, 0.0);
     }
     const double bodyErr = toPInPI(brain->data->kickDir - brain->data->robotPoseToField.theta);
-    return cap(bodyErr * 1.5, VT_LIMIT, -VT_LIMIT);
+    return yawControl(brain, bodyErr, stKickDir, VT_LIMIT, VT_GAIN, 0.0);
+}
+
+// 推球前的“先对准再推”闸：球偏在侧前方时直接 crabWalk 会变成“侧着推”（|vy|>|vx|），
+// 球越推越偏。本闸在 |ballYaw| > 0.45 且未贴脚（range > 0.25）时只转不走，转到 0.30 以内
+// 再推进（双门限留回差）；返回 true 表示本拍已自行下发速度，调用方不要再 crabWalk。
+static bool kickAimOnly(Brain *brain, double ballRange, double ballYaw) {
+    constexpr double AIM_ENTER = 0.45;  // rad ≈26°，超过这个偏差才开始“只转不走”
+    constexpr double AIM_EXIT = 0.30;   // rad ≈17°，转到这个以内才恢复推进（留回差防抖）
+    constexpr double FOOT_RANGE = 0.25; // m，贴脚时 ballYaw 已在相机盲区，不可信
+    if (ballRange <= FOOT_RANGE) return false;
+    // 进出用不同门限：ballYaw 会在门限附近抖，单门限会造成“推一拍、停一拍”的顿挫
+    static bool aiming = false;
+    if (!aiming && fabs(ballYaw) > AIM_ENTER) aiming = true;
+    else if (aiming && fabs(ballYaw) < AIM_EXIT) aiming = false;
+    if (!aiming) return false;
+    constexpr double VT_LIMIT = 0.8;
+    constexpr double VT_GAIN = 1.5;
+    static YawCtrlState stKickAim;
+    const double vtheta = yawControl(brain, ballYaw, stKickAim, VT_LIMIT, VT_GAIN, 0.0);
+    brain->client->setVelocity(0.0, 0.0, vtheta); // 驻停转向：不平移，只把球摆到正前
+    static rclcpp::Time lastAimLog = brain->get_clock()->now();
+    if (brain->msecsSince(lastAimLog) > 1000) {
+        lastAimLog = brain->get_clock()->now();
+        brain->log->log("Kick", format("aim first: ballYaw=%.2f range=%.2f vtheta=%.2f", ballYaw, ballRange, vtheta));
+    }
+    return true;
 }
 
 NodeStatus Kick::onStart()
@@ -2126,14 +2120,21 @@ NodeStatus Kick::onStart()
     }
 
     // Publish movement command
-    double angle = brain->data->ball.yawToRobot;
+    // 贴脚（range ≤ 0.25 m，相机盲区、ballYaw 不可信）→ 纯前推，vtheta 只对 kickDir。
+    // 未贴脚但球偏在侧前方 → 先驻停转向（kickAimOnly），不要边推边转把球带歪。
+    const double ballRangeNow = brain->data->ball.range;
+    const double ballYawNow = brain->data->ball.yawToRobot;
+    const double pushAngle = (ballRangeNow <= 0.25) ? 0.0 : ballYawNow;
+    if (role != "goal_keeper" && kickAimOnly(brain, ballRangeNow, ballYawNow)) {
+        return NodeStatus::RUNNING;
+    }
     if (role == "goal_keeper") {
         // 守门员：推进中保持机身转向球（行走击球出球方向=机身朝向，
         // 只平移不转向会造成侧身横移蹭球、出球方向失控）
-        double vtheta = cap(angle * 1.5, 0.8, -0.8);
-        brain->client->crabWalk(angle, _speed, vtheta);
+        double vtheta = cap(pushAngle * 1.5, 0.8, -0.8);
+        brain->client->crabWalk(pushAngle, _speed, vtheta);
     } else {
-        brain->client->crabWalk(angle, _speed, _alignVtheta(angle));
+        brain->client->crabWalk(pushAngle, _speed, _alignVtheta(pushAngle));
     }
     return NodeStatus::RUNNING;
 }
@@ -2147,10 +2148,8 @@ NodeStatus Kick::onRunning()
     // 一次连续推球切成多段“点刹”（实测 58 次 abort 中 42 次由它触发，
     // 11 次间隔 <1 s）。放宽到 0.6 m；真丢球仍由下面的球龄判据兜底。
     const double MOVE_RANGE_THRESHOLD = 0.6;
-    // 近距推球阶段（球在脚下 <0.6 m）：相机低头常贴限位、球被自身遮挡或滑出画面，
-    // 视觉短暂断流是常态。该区间把“新鲜”窗口从 300 ms 放宽到 500 ms，
-    // 避免把短暂看不见误判成丢球（实测这里是 Kick abort 的主要来源）。
-    // 远端球仍用 kBallFreshMs：那里的断流通常意味着球真的被踢走。
+    // 近距推球（球在脚下 <0.6 m）：球被自身遮挡或滑出画面是常态，“新鲜”窗放宽到 500 ms，
+    // 避免把短暂看不见误判成丢球（这里是 Kick abort 的主要来源）；远端仍用 kBallFreshMs。
     const double NEAR_BALL_RANGE_M = 0.6;
     const double NEAR_BALL_FRESH_MS = 500.0;
     const double ballFreshMs = (ballRange < NEAR_BALL_RANGE_M) ? NEAR_BALL_FRESH_MS : Brain::kBallFreshMs;
@@ -2320,9 +2319,8 @@ NodeStatus RLVisionKick::onRunning()
     double maxMsecKick = getInput<double>("max_msec_kick").value();
     
     // Check if ball is too far or cost is too high
-    // 退出条件里的“球已飞远”阀值：视觉踢把球踢到 2 m 以外就立即交还决策层。
-    // 原值 5.0 m 在实机几乎不可达（典型踢出 3~4 m），会一直挂到 max_msec_kick 超时，
-    // 表现为“踢完之后站着发呆再突然走”。
+    // 退出条件里的“球已飞远”阈值：视觉踢把球踢到 2 m 以外即交还决策层。原值 5.0 m 在实机
+    // 几乎不可达（典型踢出 3~4 m），会挂到 max_msec_kick 超时，表现为踢完站着发呆再突然走。
     bool ballTooFar = brain->data->ballDetected && brain->data->ball.range > 2.0;
     // 超时兜底（XML max_msec_kick）：踢球动作播完（约 5.7s）后 rl 侧已自动切回行走模型，
     // 若球没被踢远、视野也没丢，前面的退出条件会一直不满足——前锋会站着不动。
@@ -2332,10 +2330,8 @@ NodeStatus RLVisionKick::onRunning()
     
     if (shouldExit) {
         recordExitTime();
-        // 必须在这里清 tmImInVisualKick：本分支是“本地判定回合结束”的主路径，
-        // 若只靠 onHalted 清，就会跟 StrikerDecide 的 decision 锁存互锁——
-        // 锁存让 decision 一直等于 auto_visual_kick → 节点返回 SUCCESS 后又被重新 tick，
-        // 每次都重发 kVisualKick（实机复现：每 3.5 s 一次、模型/模式反复切换）。
+        // 必须在这里清 tmImInVisualKick：本分支是“本地判定回合结束”的主路径。只靠 onHalted 清
+        // 会与 decision 锁存互锁——每次都重发 kVisualKick（实机每 3.5 s 一次、模型模式反复切换）。
         brain->data->tmImInVisualKick = false;
         startDecelerate(500.0);
         _pendingRobocupWalk = true;
@@ -2577,7 +2573,7 @@ NodeStatus GoToReadyPosition::tick()
         vxLimit = 0.6;
         vyLimit = 0.4;
     }
-    double vthetaLimit = 1.5;
+    double vthetaLimit = 0.6; // READY 掉头不再满幅（原 1.5 被全局 1.2 截断）
     bool avoidObstacle = true;
 
     if (role == "striker") {

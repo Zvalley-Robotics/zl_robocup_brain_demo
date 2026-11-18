@@ -80,15 +80,22 @@ public:
     std::shared_ptr<VisualizationPublisher> visualizer;
     // BrainTree object, contains BehaviorTree related operations
     std::shared_ptr<BrainTree> tree;
-    // Communication object, contains communication related operations, mainly for dual-machine communication and referee communication
+    // Communication object, contains communication related operations, mainly for
+    // dual-machine communication and referee communication
     std::shared_ptr<BrainCommunication> communication;
+
+    // 球速估计器（2026-11-16）：data->ball 只有“最近一次检测的位置 + 时间戳”，没有速度。
+    // 每拍把连续检测帧拟合成场系球速，供门将预判过线点、判定球位是否陈旧（写黑盒见 updateBallEstimate）。
+    BallEstimator ballEstimator;
 
     // Constructor: create ROS2 node (nodeName handled in implementation)
     Brain();
 
     ~Brain();
 
-    // Initialize operations, only need to be called once in the main function. If the initialization process does not meet expectations, an exception can be thrown to terminate the program.
+    // Initialize operations, only need to be called once in the main function. If the
+    // initialization process does not meet expectations, an exception can be thrown to
+    // terminate the program.
     void init();
 
     // Called in the ROS2 loop
@@ -188,7 +195,7 @@ public:
      */
     void publishBrainStrategy();
 
-    // ------------------------------------------------------ SUB CALLBACKS ------------------------------------------------------
+    // ----- SUB CALLBACKS -----
 
     void gameControlCallback(const game_controller_interface::msg::GameControlData &msg);
 
@@ -206,7 +213,8 @@ public:
 
     void processDepthImage(const cv::Mat &depthFloat, int width, int height, const std_msgs::msg::Header &header);
 
-    // /robot/head_to_base 自 2026-11-11 起为 geometry_msgs/PoseStamped（zl 侧新增 header.stamp，frame_id 留空）。
+    // /robot/head_to_base 自 2026-11-11 起为 geometry_msgs/PoseStamped
+    // （zl 侧新增 header.stamp，frame_id 留空）。
     void headPoseCallback(const geometry_msgs::msg::PoseStamped &msg);
 
     /**
@@ -377,7 +385,7 @@ private:
 
     void handleCooperation();
 
-    // ------------------------------------------------------ Vision Processing ------------------------------------------------------
+    // ----- Vision Processing -----
 
     int markCntOnFieldLine(const string MarkType, const FieldLine line, const double margin = 0.2);
 
@@ -435,7 +443,7 @@ private:
     string lastStrategyBody;
     rclcpp::Time lastStrategyPubTime;
 
-    // ------------------------------------------------------ debug logs related ------------------------------------------------------
+    // ----- debug logs related -----
     void logLags();
     // 1 Hz 障碍/深度链观测：obstacles 数量、最近距离、前向距离、深度断流时长
     void logObstacleStatus();
@@ -443,7 +451,7 @@ private:
     string getComLogString(); 
     std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
-    // ------------------------------------------------------ ground truth localization bypass ------------------------------------------------------
+    // ----- ground truth localization bypass -----
     // timestamp of the last received ground truth ball message (zero = never received)
     rclcpp::Time lastGtBallTime;
     // when the ground truth ball was declared lost after a timeout (zero = not lost)
@@ -451,7 +459,7 @@ private:
     // whether the current ball state originates from ground truth
     bool gtBallActive = false;
 
-    // ------------------------------------------------------ cost smoothing & lead hysteresis ------------------------------------------------------
+    // ----- cost smoothing & lead hysteresis -----
     // cost 中值滤波：抑制丢球/摔倒等台阶项在单拍造成的突变，避免 lead 反复易手
     static constexpr int COST_HISTORY_LEN = 5;
     double costHistory[COST_HISTORY_LEN] = {0.};
@@ -465,15 +473,13 @@ private:
     bool leadSwitchTarget = true;
     rclcpp::Time leadSwitchStartTime;
 
-    // ------------------------------------------------------ teammate ball sharing ------------------------------------------------------
+    // ----- teammate ball sharing -----
     // 球位置来源（本地检测 / 队友共享）与交接保护窗：来源切换后短时间内禁止触发踢球，
     // 避免两套场系间 0.7~1.4 m 的位置跳变直接变成一脚乱踢。
     bool ballPosFromTeammate = false;
     rclcpp::Time ballPosHandoffTime;
     // 贴身 hint（队友球位离我 <2 m 或队友自己也在用记忆）：300 ms 内有效，仅用于转头
     rclcpp::Time lastTmBallHintTime;
-
-    // ------------------------------------------------------ agent related ------------------------------------------------------
     // 球位写入互斥：本地检测与队友共享都写 data->ball.posToField，无互斥时 vision(30Hz)
     // 与 tick(86Hz) 会交替覆盖（实测 12ms 级、2~4 m 跳变）。队友源生效期间必须连续
     // BALL_LOCAL_CONFIRM_FRAMES 帧本地检测才夺回；夺回后 BALL_LOCAL_LOCK_S 内禁止队友再覆盖。
@@ -493,6 +499,7 @@ private:
     double findSweepStartMs = 0.0;   // 本轮扫描起点（ms，墙钟）
     double findSweepLastReqMs = 0.0; // 最近一次取目标时刻（判“中间被别人占头”用）
 
+    // ----- agent related -----
     // In agent mode, subscribe to parameter changes and handle callbacks
     std::shared_ptr<rclcpp::ParameterEventHandler> param_subscriber_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> team_id_handle_;

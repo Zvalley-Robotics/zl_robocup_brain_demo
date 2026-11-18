@@ -210,6 +210,7 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<bool>("RLVisionKick.enableAutoVisualKick", true);
     declare_parameter<double>("RLVisionKick.autoVisualKickEnableDistMin", 0.5);
     declare_parameter<double>("RLVisionKick.autoVisualKickEnableDistMax", 1.5);
+    // 已被 XML visual_kick_ball_front 取代，仅保留声明以兼容旧 overlay 配置。
     declare_parameter<double>("RLVisionKick.autoVisualKickEnableAngle", 0.5);
     
     declare_parameter<int>("locator.min_marker_count", 5);
@@ -316,7 +317,8 @@ void Brain::init()
     // RobotClient → ZlIo 直接订阅并写入 BrainData，不再经过原厂话题。
     headPoseSubscription = create_subscription<geometry_msgs::msg::PoseStamped>("/robot/head_to_base" + topic_suffix, SUB_STATE_QUEUE_SIZE, bind(&Brain::headPoseCallback, this, _1));
 
-    // Ground truth bypass (mocap/simulation localization); subscriptions are only created when enabled
+    // Ground truth bypass (mocap/simulation localization);
+    // subscriptions are only created when enabled
     if (config->get_gt_pose_enabled()) {
         gtPoseSubscription = create_subscription<geometry_msgs::msg::Pose2D>(
             "/soccer/ground_truth_pose" + topic_suffix, rclcpp::QoS(10),
@@ -345,9 +347,8 @@ void Brain::init()
     pubKickBall = create_publisher<brain::msg::Kick>("/kick_ball", 10);
 
     // subscribe to depth image topic
-    // QoS 必须与相机发布端一致：RealSense 默认 SYSTEM_DEFAULT（通常 reliable），
-    // 而 robot_bringup/camera_params.yaml 那套是 SENSOR_DATA（best_effort）；
-    // 错配时订阅端静默收不到（不报错，只是永不进回调）。
+    // QoS 必须与相机发布端一致：RealSense 默认 SYSTEM_DEFAULT（reliable），而
+    // camera_params.yaml 那套是 SENSOR_DATA（best_effort）；错配时订阅端静默收不到。
     const string depthQosStr = config->get_depth_qos();
     rclcpp::QoS depthQos = (depthQosStr == "best_effort")
                                ? rclcpp::QoS(rclcpp::SensorDataQoS())
@@ -400,7 +401,8 @@ void Brain::init()
         team_id_handle_ = param_subscriber_->add_parameter_callback("game.team_id", team_id_cb);
         player_role_handle_ = param_subscriber_->add_parameter_callback("game.player_role", player_role_cb);
 
-        // agent mode does not have referee, force clear penalty status to allow normal communication between teammates
+        // agent mode does not have referee, force clear penalty status to allow
+        // normal communication between teammates
         std::fill(std::begin(this->data->penalty), std::end(this->data->penalty), PENALTY_NONE);
     };
 
@@ -651,7 +653,9 @@ void Brain::handleCooperation() {
     }
     log_(format("gcAliveCnt: %d", gcAliveCount));
 
-    // Process teammate information. If no information is received from a teammate for a long time, or the teammate is in a penalty state according to the referee, the teammate is considered offline. Then get the indices of all online teammates.
+    // Process teammate information. If no information is received from a teammate for a long
+    // time, or the teammate is in a penalty state according to the referee, the teammate is
+    // considered offline. Then get the indices of all online teammates.
     for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
         if (i == selfIdx) continue; // Skip self
 
@@ -849,19 +853,15 @@ void Brain::handleCooperation() {
     
         }
     }
-    // If there is no strategy during halftime, switch the role back to the initial setting at the start of the second half
+    // If there is no strategy during halftime, switch the role back to the initial
+    // setting at the start of the second half
     if (tree->getEntry<string>("gc_game_state") == "INITIAL") {
         tree->setEntry<string>("player_role", selfRole);
     }
 
-    // New lead logic, no longer sending commands, but judging by itself 
-    // 追球权（lead）只在前锋之间竞争，守门员的 cost 不参与：
-    // 否则球在己方半场时守在门口的守门员往往是全场最低 cost，会把所有前锋压成非 lead
-    // （集体进 assist 慢速站位），形成“守门员一人远处追球、其他人看戏”。
-    // 追球权互斥：cost 唯一最低的存活前锋当 lead；cost 差在 LEAD_COST_DEADBAND 内按
-    // player_id 小者优先（两机独立计算，用同一组 cost 值，结论必然一致）。原逻辑只在
-    // “最低 cost 队友 < 阈值”时让位，两台前锋 cost 都 ≥ 阈值（球远、丢球、倒地恢复期、
-    // 互挡加成）时会同时判 lead，双 chase 奔向同一球后点且 Chase 无队友让位 → 两机挤在一起。
+    // lead 只在前锋之间竞争：守门员 cost 不参与，否则球在己方半场时 GK 往往全场最低 cost，
+    // 会把前锋全压成非 lead（集体慢速站位）。唯一性：cost 最低的存活前锋当 lead，cost 差在
+    // LEAD_COST_DEADBAND 内按 player_id 小者优先（两机独立算同一组 cost，结论必然一致）。
     double tmMinCost = 1e5;
     int myCostRank = 0;
     int myStrikerIDRank = 0;
@@ -880,12 +880,9 @@ void Brain::handleCooperation() {
     data->tmMyCostRank = myCostRank;
     data->myStrikerIDRank = myStrikerIDRank;
 
-    // 迟滞（2026-11-02）：唯一性判据本身保证“同一组 cost 下恰有一台 lead”，但两台机比较的
-    // 是“自己的实时 cost”与“对方 30~90 ms 前广播的 cost”，而 cost 里的丢球/摔倒惩罚在跳变
-    // 瞬间会短时改变排序（实机实测 P1 cost 单采样跳变 >5 共 307 次）。逐拍比较会出现互不
-    // 一致的结论：双 LEAD 与双无 LEAD 各占约 3%，lead 平均 3.4 s 易手一次，两机在 chase 与
-    // assist 之间来回切，最终挤在球附近。候选结论连续保持 LEAD_SWITCH_HOLD_MS 才真正换手，
-    // 把单拍瞬态滤掉；输入持续偏离时仍然会在一拍内收敛，不改变正常换手速度。
+    // 迟滞：两机比较的是“自己实时 cost”与“对方 30~90 ms 前广播的 cost”，丢球/摔倒惩罚
+    // 跳变会短时改变排序，逐拍比较会出现双 LEAD / 双无 LEAD 各约 3%、lead 3.4 s 易手一次。
+    // 候选结论连续保持 LEAD_SWITCH_HOLD_MS 才真正换手，输入持续偏离时仍能一拍内收敛。
     constexpr double LEAD_SWITCH_HOLD_MS = 200.0;
     const bool desiredLead = !teammateBetter;
     if (desiredLead != data->tmImLead) {
@@ -974,7 +971,8 @@ void Brain::handleCooperation() {
 
     tree->setEntry<bool>("is_lead", data->tmImLead);
 
-    // In the READY state, based on the initial settings and the number of players on the field, reassign roles.
+    // In the READY state, based on the initial settings and the number of players
+    // on the field, reassign roles.
     if (
         (tree->getEntry<string>("gc_game_state") == "READY" || tree->getEntry<string>("gc_game_sub_state") == "GET_READY") 
         && gcAliveCount == numOfPlayers
@@ -1631,7 +1629,8 @@ void Brain::gameControlCallback(const game_controller_interface::msg::GameContro
 
     int liveCount = 0;
     int oppoLiveCount = 0;
-    // Handle penalty state. penalty[playerId - 1] represents whether our player is in a penalty state. Handling penalty state means the player cannot move.
+    // Handle penalty state. penalty[playerId - 1] represents whether our player is in a
+    // penalty state. Handling penalty state means the player cannot move.
     for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
         data->penalty[i] = static_cast<int>(myTeamInfo.players[i].penalty);
         
@@ -1689,7 +1688,8 @@ void Brain::detectionsCallback(const vision_interface::msg::Detections &msg)
         {
             persons.push_back(obj);
 
-            // For debugging purposes, you can set treat_person_as_robot in the config to treat Person as Robot
+            // For debugging purposes, you can set treat_person_as_robot in the config
+            // to treat Person as Robot
             if (config->get_treat_person_as_robot())
                 robots.push_back(obj);
         }
@@ -1848,15 +1848,9 @@ void Brain::depthCameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPt
 
 void Brain::headPoseCallback(const geometry_msgs::msg::PoseStamped& msg)
 {
-    // /robot/head_to_base 语义（zl 侧 head_pose.py）：eye(optical) -> 躯干系（torso_link 原点），
-    // 去航向 yaw、只保留 roll/pitch，**不含 base_height**。旋转已含相机安装俯仰与光学系轴变换，
-    // 因此点云直接左乘即可转到 base 系，不需要再减高度、也不能再乘 camera.extrin。
-    //
-    // 消息类型自 2026-11-11 起为 PoseStamped（zl 侧新增 header.stamp、frame_id 留空），
-    // 位姿字段改在 msg.pose 下；header.stamp 暂不参与计算（跨机时钟不同源，见 vision PoseCallBack）。
-    //
-    // 不要退回 /robot/head_pose：那是骨盆系（过 waist_yaw），点云会随腰部扭转，
-    // 自车排除框（正前方）会随腰角失效。
+    // /robot/head_to_base 语义：eye(optical) → 躯干系，去 yaw、只保留 roll/pitch，不含
+    // base_height；点云直接左乘即可，不要再减高度或乘 camera.extrin。消息为 PoseStamped
+    // （位姿在 msg.pose 下，header.stamp 暂不参与计算）。不要退回 /robot/head_pose（骨盆系）。
     Eigen::Matrix4d camToBase = Eigen::Matrix4d::Identity();
     Eigen::Quaterniond q(msg.pose.orientation.w, msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z);
     if (q.norm() > 1e-6) {
@@ -2066,7 +2060,8 @@ vector<FieldLine> Brain::processFieldLines(vector<FieldLine>& fieldLines) {
         }
     }
     int sizeAfter = original.size();
-    // filter out lines that are too short and infer direction while ditch lines whose dir cannot be inferred
+    // filter out lines that are too short and infer direction while ditch lines whose dir
+    // cannot be inferred
     double valve = 0.2;
     for (int i = 0; i < original.size(); i++) {
         auto line = original[i];
@@ -2236,12 +2231,9 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
 
 void Brain::detectProcessMarkings(const vector<GameObject> &markingObjs)
 {
-    // 2026-10-14: 50 → 30。llvmpipe 软渲染下标记成像质量偏低：入场区
-    // （真实 x≈2.35, y≈5.14）实测 LCross 的 confidence 在 30~50 之间抖动，
-    // 阈值 50 时单帧最多只有 1 个标记（TCross），SelfLocateEnterField 的
-    // minMarkerCnt 永不满足、入场定位无法收敛。降至 30 后单帧典型得到
-    // LCross+TCross 两个标记（45s 探针：48/191 帧出现该组合），配合
-    // locator.min_marker_count=2 可完成入场定位。
+    // 入场标记 confidence 阈值 50 → 30：llvmpipe 软渲染下 LCross 的 confidence 在 30~50 抖，
+    // 50 时单帧最多 1 个标记，SelfLocateEnterField 的 minMarkerCnt 永不满足。降到 30 后典型
+    // 得到 LCross+TCross，配合 locator.min_marker_count=2 可完成入场定位。
     const double confidenceValve = 30; // Exclude markings with confidence below this threshold
     vector<GameObject> markings = {};
     for (int i = 0; i < markingObjs.size(); i++)
@@ -2309,7 +2301,8 @@ void Brain::detectProcessVisionBox(const vision_interface::msg::Detections &msg)
     vbox.timePoint = timePoint;
     for (int i = 0; i < msg.corner_pos.size(); i++) vbox.posToRobot.push_back(msg.corner_pos[i]);
 
-    // Handle the case where the top-left and top-right points have x < 0, indicating an infinitely distant scene
+    // Handle the case where the top-left and top-right points have x < 0, indicating an
+    // infinitely distant scene
     const double VISION_LIMIT = 20.0;
     vector<vector<double>> v = {};
     for (int i = 0; i < 4; i++) {
@@ -2365,7 +2358,7 @@ void Brain::logDepth(int grid_x_count, int grid_y_count, vector<vector<int>> &gr
     
     // Publish obstacle grid to ROS2 topic
     // ROS OccupancyGrid uses row-major format: index = y * width + x
-    // width corresponds to the number of cells in the X direction, height corresponds to the number of cells in the Y direction
+    // width = cells in X direction, height = cells in Y direction
     std::vector<int8_t> grid_data(grid_x_count * grid_y_count, -1);  // -1 represents unknown
     for (int j = 0; j < grid_y_count; j++) {        // Y direction (rows)
         for (int i = 0; i < grid_x_count; i++) {    // X direction (columns)
@@ -2648,7 +2641,8 @@ void Brain::processDepthImage(const cv::Mat &depthFloat, int width, int height, 
 
         // Clean up old obstacles
         for (int i = 0; i < obs_old.size(); i++) {
-           // First, clear old obstacles within the current field of view. Note that the angle is only roughly calculated, and the range is appropriately expanded using an offset.
+           // First, clear old obstacles within the current field of view. Note that the angle is
+           // only roughly calculated, and the range is appropriately expanded using an offset.
             double visionLeft = data->headYaw + config->depthCameraFovX / 2;
             double visionRight = data->headYaw - config->depthCameraFovX / 2;
             auto obs = obs_old[i];
@@ -2657,7 +2651,8 @@ void Brain::processDepthImage(const cv::Mat &depthFloat, int width, int height, 
             double obsYawRight = atan2(obs.posToRobot.y + offset, obs.posToRobot.x + offset);
             if (obsYawLeft < visionLeft && obsYawRight > visionRight) continue; 
 
-            // If the old obstacle is too close to the new obstacle, it is considered no longer present to prevent accumulation at the boundaries.
+            // If the old obstacle is too close to the new obstacle, it is considered no longer
+            // present to prevent accumulation at the boundaries.
             bool found = false;
             for (int j = 0; j < obs_new.size(); j++) {
                 auto obs_n = obs_new[j];
@@ -2835,7 +2830,7 @@ bool Brain::calcSafeAvoidDir(double startAngle, double safeDist, double maxOffse
     return true;
 }
 
-bool Brain::calcTeammateSeparationVelocity(double &vx, double &vy, double &vtheta, double rSep, double speed) {
+bool Brain::calcTeammateSeparationVelocity(double &vx, double &vy, double &vtheta, double rSep, double speed, double headingRad) {
     auto robotPose = data->robotPoseToField;
     auto ballPos = data->ball.posToField;
     int selfIdx = config->get_player_id() - 1;
@@ -3241,7 +3236,7 @@ void Brain::logStatusToConsole() {
         prtDebug(msg);
     }
 
-    // 2026-11-05 定位振荡取证：同一拍打印"机器人在场地图的位姿 + 球在机器人系 + 球在场地图 + 决策"。
+    // 定位振荡取证：同一拍打印"机器人在场地图的位姿 + 球在机器人系 + 球在场地图 + 决策"。
     // 用途：区分"目标（球位/场地坐标）本身在跳"与"执行层在摆"——只看 setVelocity_out 无法区分。
     // debug.track_log_hz <= 0 时关闭（默认）。
     {
@@ -3377,15 +3372,9 @@ void Brain::agentCommandCallback(const std_msgs::msg::String::SharedPtr msg) {
 
     tree->setEntry<int>("control_state", control_state);
     tree->setEntry<string>("gc_game_state", game_state);
-    // Currently, playerRole is automatically modified during runtime in the following situations:
-    // handleCooperation
-    //   1. If there is no strategy during halftime, the role will be switched back to the initial setting at the start of the second half, requiring gc_game_state to be INITIAL corresponding to the soccer_agent's positioning state.
-    //   2. If role_switch is enabled, the role will be automatically switched when the number of players on the field is insufficient after a penalty.
-    //   3. In the ready state, the role will be set according to the player_role parameter only when the field is full.
-    //   4. When the goalkeeper goes out, the role will be automatically switched.
-    // Remote control switches playerRole
-    //
-    // After switching the control state, set the player_role to ensure it takes effect
+    // playerRole 会在运行期被改写：handleCooperation 的半场重置 / 角色切换（role_switch
+    // 开启且场上人数不足、READY 满员按 player_role 设定、守门员下场）与遥控指令。
+    // 切换 control_state 之后须再写一次 player_role 才会生效。
     tree->setEntry<string>("player_role", config->get_player_role());
 }
 

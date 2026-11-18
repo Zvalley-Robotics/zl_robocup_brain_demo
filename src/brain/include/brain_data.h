@@ -48,7 +48,7 @@ public:
     Eigen::Matrix4d camToRobot = Eigen::Matrix4d::Identity();
     // true = 已收到有效的 /robot/head_to_base（eye->torso 原点、去 yaw、不含 base_height）；
     // 为 false 时深度点云无法从相机系转到 base 系，
-    // processDepthImage 会跳过并限频告警（否则会把相机系坐标当成 base 系，产生 假障碍）。
+    // processDepthImage 会跳过并限频告警（否则会把相机系坐标当成 base 系，产生假障碍）。
     bool camToRobotValid = false; 
 
 

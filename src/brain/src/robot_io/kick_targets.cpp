@@ -229,6 +229,18 @@ void KickTargets::update(
   publishTick(pose_x, pose_y, pose_theta, nav, now_sec);
 }
 
+bool KickTargets::active(double now_sec) const
+{
+  // 关闭时保持旧行为（消费端用兜底假门），不把“未启用”判成“不可踢”。
+  if (!brain_->get_parameter("zl_io.kick_targets_enable").as_bool()) {
+    return true;
+  }
+  if (!stable_ || last_publish_sec_ <= 0.0) {
+    return false;
+  }
+  return (now_sec - last_publish_sec_) <= pose_timeout_sec_ + 0.10;
+}
+
 void KickTargets::publishTick(
   double pose_x, double pose_y, double pose_theta, const ZlIo::NavSnapshot & nav,
   double now_sec)

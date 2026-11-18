@@ -38,19 +38,26 @@
                              handoff_ball_speed_relax_max=0.80，否则继续跟球不交棒。
                              依据：11-09 场 6 次轻踢里有 3 次的交棒球速是 1.02/1.29/3.29 m/s，
                              全是无条件超时放行 → 模型 0.5 s 建模后球已跑远，只能蹭到 0.6~0.9 m
-                             或被 adapter 的 KICK_ESCAPE_M=1.2 直接收尾。 -->
+                             或被 adapter 的 KICK_ESCAPE_M=1.2 直接收尾。
+                             （2026-11-17）t4_kicking 已能自动瞄门（正向 180° 可踢），视觉踢改判“球/门都在机前锥 + 瞄准目标有效”，
+                             kick_dir_align / kick_body_align 从此只影响行走踢；visual_kick_ball_front 按实测能力边界调。 -->
                         <StrikerDecide decision_out="{decision}" decision_in="{decision}"
-                                       chase_threshold="0.90"
+                                       chase_threshold="1.10"
                                        kick_dir_align="0.22" kick_body_align="0.26"
-                                       kick_range_min="0.33" kick_force_msec="3000"
+                                       kick_range_min="0.40" kick_force_msec="3000"
                                        handoff_ball_speed_max="0.35" handoff_ball_still_timeout_ms="1000"
-                                       handoff_ball_speed_relax_max="0.80" />
+                                       handoff_ball_speed_relax_max="0.80"
+                                       visual_kick_ball_front="1.30" visual_kick_goal_front="1.40"
+                                       visual_kick_require_goal_target="true" visual_kick_shoot_only="true" />
                         <SubTree ID="FindBall" _while="decision=='find'" _autoremap="true" />
                      </ReactiveSequence>
-                        <Assist _while="decision == 'assist'" vx_limit = "0.5" vy_limit="0.5" />
+                        <Assist _while="decision == 'assist'" vx_limit = "1.0" vy_limit="0.7" />
                         <!-- C（2026-11-06）：dist 0.1 -> 0.35。目标点从“球后 0.1 m”改到“球后 0.35 m”，减少追球末段直冲球心
-                             导致冲进 <kick_range_min 后只能贴脸行走踢；现与模型最佳踢球距离 0.35 m 对齐。 -->
-                        <Chase   _while="decision == 'chase'"  vx_limit="0.9"  vy_limit="0.2"  vtheta_limit="1.0"  dist="0.35" safe_dist="0.5" />
+                             导致冲进 <kick_range_min 后只能贴脸行走踢；现与模型最佳踢球距离 0.35 m 对齐。
+                             （2026-11-17）整体提速 2×：vx_limit 0.9 -> 2.2、vy 0.2 -> 0.35、vtheta 1.0 -> 1.6，
+                             safe_dist 0.5 -> 0.85（圆弧绕后的可跟踪速度 = vtheta_limit × safe_dist，太小绕不回来）；
+                             实际行进速度再由“速度包络”与接球刹车模型（Brain::brakeSpeed）按清距缩放。 -->
+                        <Chase   _while="decision == 'chase'"  vx_limit="2.2"  vy_limit="0.35"  vtheta_limit="1.6"  dist="0.35" safe_dist="0.85" />
                         <RLVisionKick _while="decision == 'auto_visual_kick'" min_msec_kick="1500" max_msec_kick="3000" range="6.0"/>
                         <!-- vtheta 增益/上限 1.5/1.5 -> 1.0/1.0（与 Chase 对齐）：3588 取消速度折半后本体 1:1 执行，
                              Adjust 的实际转向角速度翻倍，ballYaw>46° 即打满全局 vtheta_limit=1.2；配合约 100~200ms

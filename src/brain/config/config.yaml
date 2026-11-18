@@ -88,9 +88,9 @@ brain_node:
       # 板端插值固定 0.5 s，低于 500 头部永远到不了位（内部夹到 ≥500）。
       head_sweep_interval_ms: 550.0
     
-    # 2026-11-05 定位振荡取证（默认关闭）。
-    # >0 时按该频率打印 dbg/track：pose(场地图) / ballR(机器体系) / ballF(场地图) / range yaw det age / kickDir / decision。
-    # 用途：区分“目标（球位或位姿）本身在跳”与“执行层在摆”——单看 setVelocity_out 无法区分。
+    # 定位振荡取证（默认关闭）：>0 时按该频率打印 dbg/track——pose(场地图) / ballR(机器体系) /
+    # ballF(场地图) / range yaw det age / kickDir / decision。用途：区分“目标本身在跳”与
+    # “执行层在摆”——单看 setVelocity_out 无法区分。
     debug:
       track_log_hz: 0.0
 
@@ -130,12 +130,11 @@ brain_node:
       # 踢球 motion ended 后的速度抑制窗（s，0=关闭）。
       # 依据 2026-11-09 39 号机：击球瞬间本体仍在侧倾，motion ended 后 0.4 s 就发 vx=0.67
       # 会把机身压翻（切回后 1 s 内侧倾 17°→81°）。窗内一律发零速并刷 zl_io/suppress 日志。
-      kick_settle_suppress_sec: 0.8
+      kick_settle_suppress_sec: 1.2
 
-      # ---- 真实球门位姿合成（原 goal_pose_synth 独立节点，2026-11-03 并入）----
-      # 门心与门外法线在 Brain 场地系（+x 指向对方球门）是常量，只要有机器人位姿就能算基座系门位姿。
-      # 输出默认用域100 的 /soccer/goal_*_robot，由板侧 domain_bridge remap 成 zl 契约名；
-      # 六机自包含形态（无 domain_bridge）可改指向 /robot/perception/target_*。
+      # ---- 真实球门位姿合成（原 goal_pose_synth 节点，已并入 Brain）----
+      # 门心与门外法线在场系是常量，有机器人位姿即可算基座系门位姿；默认输出域100 的
+      # /soccer/goal_*_robot，由板侧 domain_bridge remap；六机自包含形态改指 target_*。
       kick_targets_enable: true # 运行期可 ros2 param set /brain_node zl_io.kick_targets_enable false
       goal_line_x: 7.0 # 门线（场地系 x，adult_size 为 7.0）
       goal_line_y: 0.0
@@ -255,19 +254,40 @@ brain_node:
       obstacle_memory_msecs: 500.0
       avoid_during_kick: false
       kick_ao_safe_dist: 3.0
-      # S2（2026-10-27 开启）：深度栅格已实测可用（人站正前 1.3 m 时 fwd=1.30、maxconf≈139，
-      # 与 depth_probe.py --grid 同帧误差 <0.01 m）。
-      # chase_ao_safe_dist 必须小于 max_x(3.0)，否则 findSafeDirections 在任何方向都找不到
-      # “安全方向”（栅格最大量程 3.0），calcAvoidDir 恒返回 0，绕行会退化成直行；1.8 留 1.2 m 余量。
+      # 深度栅格已实测可用（人站正前 1.3 m 时 fwd=1.30、maxconf≈139，与 depth_probe 同帧
+      # 误差 <0.01 m）。chase_ao_safe_dist 必须小于 max_x(4.0)，否则任何方向都找不到
+      # “安全方向”、calcAvoidDir 恒返回 0、绕行退化成直行；3.0 留 1.0 m 余量。
       avoid_during_chase: true
-      chase_ao_safe_dist: 1.8
+      # 2026-11-17 提速 2×：1.5 → 3.0（旧值 1.8 是按 1.2 m/s 定的，2.2 m/s 下一脚刹车就进 1.8）。
+      chase_ao_safe_dist: 3.0
       # 绕行角上限（度）：栅格只覆盖相机 FOV（水平半角约 40°）。实测 0.5 m 宽的人站在 1.3 m 处，
       # 需要 ±30~35° 才能绕开；取 30 会频繁退化为“停车/减速”，故取 35（仍留 ~5° 盲区余量）。
       avoid_max_offset_deg: 35.0
-      # 贴身区（m）：障碍近于此距离时不再做小角度绕行，直接停车。
-      # 原因：distToObstacle 是“走廊有没有东西”而非距离场，小角度偏转会把障碍推出
-      # collision_threshold 后返回 1e9，回查会把 0.62 m 的障碍误判成“已绕开”（实测 dir 塌缩到 -2.9°）。
-      avoid_min_clearance_m: 0.8
+      # 贴身区（m）：障碍近于此距离时不再做小角度绕行，直接停车。原因：distToObstacle 是
+      # “走廊有没有东西”而非距离场，小角度偏转会把障碍推出 collision_threshold 后返回 1e9，
+      # 回查会把 0.62 m 的障碍误判成“已绕开”（实测 dir 塌缩到 -2.9°）。
+      # 2026-11-17 提速 2×：0.8 → 1.3（停车距离随速度平方增长）。
+      avoid_min_clearance_m: 1.3
+      # 绕行分支基准线速度（m/s）：Chase/Assist 共用，原先两处硬编码 0.5。
+      # 它不是限速阀——绕行时实际速度就是它（微偏转分支为 0.7×，停车分支为 0.5×），
+      # 与 vx_limit / XML vx_limit 均无关。2026-11-17 提速 2×：0.5 → 0.9。
+      avoid_speed: 0.9
+      # ---- 速度包络（2026-11-17 第二版：线性 → 刹车距离模型） ----
+      # 旧式 v = gain×(d−margin) 在 2 m/s 档位数学上到不了上限（需 d≥3.0 = 栅格边缘），故改为
+      #    v = −a·τ + √((a·τ)² + 2a·max(0, d − margin))
+      # 其中 a = speed_envelope_decel（本体可达减速度）、τ = speed_envelope_latency（总滞后）。
+      # 典型曲线（a=2.5, τ=0.20, margin=0.35）：d=2.5→2.27、2.0→1.96、1.5→1.55、1.2→1.31、
+      # 1.0→1.10、0.8→0.88，再由 floor/ceiling 夹住。只降不升，调用方取 min(自身速度, cap)。
+      # clearance 取三者最小：沿行进方向的障碍走廊清距、最近存活队友距离、沿行进方向到边线距离。
+      # 关闭方式：speed_envelope_enable=false（或 ceiling<=0 直接取 robot.vx_limit）。
+      speed_envelope_enable: true
+      speed_envelope_decel: 2.5
+      speed_envelope_latency: 0.20
+      speed_envelope_floor: 0.7
+      speed_envelope_ceiling: 2.2
+      speed_envelope_margin: 0.35     # m，障碍：制动之外再留的静态余量
+      speed_envelope_tm_margin: 0.70  # m，队友清距里扣掉的余量（含双方运动）
+      speed_envelope_field_margin: 0.60 # m，边线清距里扣掉的余量
       # 每帧发布深度点云 + 障碍栅格可视化（30 Hz 重操作），仅排查时开
       publish_pointcloud: false
 
@@ -275,7 +295,7 @@ brain_node:
       enableAutoVisualKick: true
       autoVisualKickEnableDistMin: 0.2
       autoVisualKickEnableDistMax: 4.0
-      autoVisualKickEnableAngle: 0.8
+      # 方位门已由行为树 XML 的 visual_kick_ball_front 取代（本键不再参与判定）
 
     locator:
       min_marker_count: 2
@@ -313,12 +333,9 @@ brain_node:
       retry_max_count: 2
 
     ground_truth:
-      # Localization bypass for mocap/simulation setups (default off; when off, the
-      # vision + particle filter pipeline behaves exactly as before).
-      # When enabled, subscribes /soccer/ground_truth_pose|ball (forwarded by
-      # brain_zl_bridge): ground truth pose calibrates localization directly (particle
-      # filter short-circuited); ground truth ball overrides the vision ball until it
-      # stops publishing, then vision takes over again.
+      # Localization bypass for mocap/simulation (default off). When enabled, subscribes
+      # /soccer/ground_truth_pose|ball (forwarded by brain_zl_bridge)：gt pose 直接标定定位
+      # （短路粒子滤波），gt ball 在持续发布期间覆盖视觉球。关闭时与旧行为一致。
       enable_pose: false
       enable_ball: false
       ball_timeout_sec: 1.0 # seconds without a ground truth ball before it is considered lost
