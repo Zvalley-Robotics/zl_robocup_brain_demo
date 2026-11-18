@@ -40,6 +40,7 @@
 #include <stdexcept>
 
 #include "brain_config.h"
+#include "ball_estimator.h"
 #include "brain_data.h"
 #include "brain_log.h"
 #include "brain_tree.h"
@@ -308,6 +309,9 @@ private:
     void loadConfig();
 
     void updateBallMemory();
+
+    // 球速估计 + 黑盒量输出（ball_vel_x/ball_vel_y/ball_speed/ball_age_ms/ball_est_valid）
+    void updateBallEstimate();
 
     void updateRobotMemory();
 

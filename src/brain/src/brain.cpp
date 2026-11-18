@@ -114,6 +114,28 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.tm_ball_conflict_dist", 1.0);
     declare_parameter<double>("strategy.tm_ball_hint_peer_sep", 1.5);
     declare_parameter<double>("strategy.ball_src_guard_ms", 150.0);
+    // 球速估计（2026-11-16，门将拦截第 1 档）：用 0.35 s 窗口最小二乘拟合场系球速。
+    // window_s 越大越平滑但滞后越多；max_speed 之外视为检测跳变并重置；reset_ms 无检测
+    // 即清空（旧速度不得用于外推）；min_samples 不足时不输出速度。
+    declare_parameter<double>("strategy.ball_est_window_s", 0.35);
+    declare_parameter<double>("strategy.ball_est_max_speed", 6.0);
+    declare_parameter<double>("strategy.ball_est_reset_ms", 500.0);
+    declare_parameter<int>("strategy.ball_est_min_samples", 3);
+    // 门将球位新鲜度：超过 stale_ms 无新检测即不驱动站位（回 hold 守门），
+    // 预测只用 ≤ pred_max_age_ms 的球位（再旧的话外推误差大于收益）。
+    declare_parameter<double>("strategy.gk_ball_stale_ms", 500.0);
+    declare_parameter<double>("strategy.gk_ball_pred_max_age_ms", 400.0);
+    // 门将拦截几何（2026-11-17，第 2 档）：
+    //   gk_pred_min_speed   球速超过该值才做“过线点预判”（m/s，原硬编码 0.35 漏慢球）
+    //   gk_pred_max_tti_s   预判时间窗（s，原硬编码 2.0；放宽到 3.5 补地滚球）
+    //   gk_target_track_mps 站位目标点速率上限（m/s），抗定位跳变（实测每 10 s 跳 >0.3 m）
+    declare_parameter<double>("strategy.gk_pred_min_speed", 0.25);
+    declare_parameter<double>("strategy.gk_pred_max_tti_s", 3.5);
+    declare_parameter<double>("strategy.gk_target_track_mps", 0.6);
+    // 门将 y 轴加速度上限（m/s²）：全局 accel_limit_vy=1.2 从 0 到 0.6 要 0.5 s，
+    // 在 1 s 级扑救窗口里吃掉一半时间；取 2.5 与本体自身平滑值对齐（板端 rl_manager ≈2.5）。
+    // <=0 回退到全局值。
+    declare_parameter<double>("strategy.gk_accel_vy", 2.5);
     declare_parameter<bool>("strategy.limit_near_ball_speed", true);
     declare_parameter<double>("strategy.near_ball_speed_limit", 0.3);
     declare_parameter<double>("strategy.near_ball_range", 4.0);
@@ -538,6 +560,9 @@ void Brain::tick()
     updateMemory();
     handleSpecialStates();
     handleCooperation();
+    // 球速估计必须在 handleCooperation 之后：球源 LOCAL↔TM 切换、本机确认锁都在那一步落定，
+    // 这里才拿得到本拍最终的 data->ball。
+    updateBallEstimate();
 
     tree->tick();
 
@@ -989,6 +1014,31 @@ void Brain::updateBallMemory()
     updateRelativePos(data->ball);
     updateRelativePos(data->tmBall);
     tree->setEntry<double>("ball_range", data->ball.range);
+}
+
+void Brain::updateBallEstimate()
+{
+    // 球位来源切换（LOCAL↔TM，两套场系差 0.7~1.4 m）时整段重置：
+    // 否则交接瞬间的位置跳变会被拟合成几 m/s 的假速度，门将据此算出毫无意义的过线点。
+    if (tree->getEntry<bool>("ball_src_guard")) ballEstimator.reset();
+
+    const double ageMs = msecsSince(data->ball.timePoint);
+    ballEstimator.update(data->ball, data->ballDetected, ageMs,
+                         get_parameter_or("strategy.ball_est_window_s", 0.35),
+                         get_parameter_or("strategy.ball_est_max_speed", 6.0),
+                         get_parameter_or("strategy.ball_est_min_samples", 3),
+                         get_parameter_or("strategy.ball_est_reset_ms", 500.0));
+
+    const auto &est = ballEstimator.state();
+    // 速度只在“球位仍在 kBallFreshMs 内”时对外有效：过了新鲜窗位置本身就是旧值，再叠加速度
+    // 只会把误差做大，消费端应退回保守站位（见 GoToGoalBlockingPosition）。
+    // 不另判 data->ballDetected：视觉 30 Hz 的单帧掉帧不应让速度逐拍失效，球龄才是真判据。
+    const bool valid = est.valid && ageMs <= kBallFreshMs;
+    tree->setEntry<double>("ball_vel_x", valid ? est.vx : 0.0);
+    tree->setEntry<double>("ball_vel_y", valid ? est.vy : 0.0);
+    tree->setEntry<double>("ball_speed", valid ? est.speed : 0.0);
+    tree->setEntry<double>("ball_age_ms", ageMs);
+    tree->setEntry<bool>("ball_est_valid", valid);
 }
 
 void Brain::updateRobotMemory() {

@@ -244,18 +244,9 @@ public:
     void onHalted() override {};
 
 private:
-    // 2026-10-30: 高位 0.45 → 0.22（地面可视 ~1.6 m → ~3.6 m），去掉末尾重复的回中点，
-    // 6 点 × 550 ms 一轮 3.3 s。点数变更后 onRunning 的结束判据用 sizeof 自动适配。
-    double _cmdSequence[6][2] = {
-        {0.22, 1.1},
-        {0.22, 0.0},
-        {0.22, -1.1},
-        {1.0, -1.1},
-        {1.0, 0.0},
-        {1.0, 1.1},
-    };    
-    rclcpp::Time _timeLastCmd;    
-    int _cmdIndex = 0;               
+    // 2026-11-17: 本节点只保留“扫一轮（6 点）后交回 FindBall 序列（转身/回位）”的时序；
+    // 每个点的目标姿态由 Brain::findSweepTarget() 统一给出，与 CamFindBall 同源同相位。
+    rclcpp::Time _startTime;
     Brain *brain;
 };
 
@@ -553,6 +544,27 @@ public:
 
 private:
     Brain *brain;
+    // 门将站位目标缓存（2026-11-16）：球位超过 strategy.gk_ball_stale_ms 没有新检测时
+    // 不再用旧球位重算目标（1.2 s 记忆期会把门将一路拽向旧位置），冻结最后一次目标原地守门。
+    // 每个 XML 实例各自一份，避免三个 _while 分支共享状态。
+    bool hasLastTarget_ = false;
+    double lastTargetX_ = 0.0;
+    double lastTargetY_ = 0.0;
+    // 上一拍目标时间：目标点速率限幅（抗定位跳变）的 dt 基准
+    rclcpp::Time lastTargetTime_{0, 0, RCL_ROS_TIME};
+    // 定位跳变门（2026-11-17）：odom→field 跳变会让“机体系目标误差”单拍突变，
+    // 直接变成反向速度。这里缓存上一拍的误差/指令，突变时沿用旧指令。
+    bool hasLastCmd_ = false;
+    double lastErrX_ = 0.0;
+    double lastErrY_ = 0.0;
+    double lastCmdVx_ = 0.0;
+    double lastCmdVy_ = 0.0;
+    double lastCmdVtheta_ = 0.0;
+    bool jumping_ = false;
+    rclcpp::Time jumpStart_{0, 0, RCL_ROS_TIME};
+    // 上拍指令时间：间隔过大（节点刚被重新激活/长时间未 tick）时不做跳变判断，
+    // 避免拿上一个回合的误差去比对。
+    rclcpp::Time lastCmdTime_{0, 0, RCL_ROS_TIME};
 };
 
 

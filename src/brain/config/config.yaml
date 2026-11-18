@@ -171,9 +171,45 @@ brain_node:
       tm_ball_conflict_dist: 1.0
       tm_ball_hint_peer_sep: 1.5
       ball_src_guard_ms: 150.0
-      limit_near_ball_speed: false
-      near_ball_speed_limit: 0.2
-      near_ball_range: 3.0
+      # 球速估计（2026-11-16，门将拦截第 1 档）：把 30 Hz 的离散球位拟合成场系球速。
+      #   ball_est_window_s    拟合窗口；越大越平滑但滞后越多（0.35 ≈ 10 帧）
+      #   ball_est_max_speed   拟合结果超出即判检测跳变并重算（m/s）
+      #   ball_est_min_samples 样本数不足时不输出速度（防两帧噪声变假速度）
+      #   ball_est_reset_ms    无检测超过该时长清空（旧速度禁止用于外推）
+      ball_est_window_s: 0.35
+      ball_est_max_speed: 6.0
+      ball_est_min_samples: 3
+      ball_est_reset_ms: 500.0
+      # 门将球位新鲜度：超过 gk_ball_stale_ms 无新检测即不驱动站位（回 hold 守门，站位冻结）；
+      # 过线点预判只用 ≤ gk_ball_pred_max_age_ms 的球位（更旧时外推误差大于收益）。
+      # 注：站位节点自身的速度上限在 behavior_trees/subtrees/subtree_goal_keeper_play.xml
+      # （vx_limit/vy_limit），节点默认值 0.1/0.1 等于把门将钉在站位点上；
+      # 门将的 vy 由 GoToGoalBlockingPosition 逐次透传给 setVelocity 覆盖全局
+      # robot.vy_limit（0.4），只影响门将，前锋/Assist 仍走 0.4。
+      gk_ball_stale_ms: 500.0
+      gk_ball_pred_max_age_ms: 400.0
+      # 门将拦截几何（2026-11-17）：
+      #   gk_pred_min_speed   球速超过该值才做过线点预判。50 号机日志显示 1.9 m/s 的
+      #                       地滚球（原 0.35 门限能过）是 TTI 2.44 s 超窗才漏的，两者同改。
+      #   gk_pred_max_tti_s   预判时间窗：射门球 0.5~1.5 s 到线，但慢速地滚球到线需 2~3 s，
+      #                       原 2.0 s 上限使门将站在原地不动（实测 t=276 s 漏球）。
+      #   gk_target_track_mps 目标点速率上限，用于吸收定位跳变：50 号机 odom→field
+      #                       每 10 s 跳一次 >0.3 m（最大 5.38 m），跳变会把目标点整体搬走，
+      #                       使门将瞬时下发反向速度（cmd vy=-0.40 实测只走 -0.02）。
+      gk_pred_min_speed: 0.25
+      gk_pred_max_tti_s: 3.5
+      gk_target_track_mps: 0.6
+      # 门将 y 轴加速度上限：全局 accel_limit_vy=1.2 从 0 到 0.6 需 0.5 s，
+      # 在 1 s 级扑救窗口里占一半时间；2.5 与本体自身平滑值对齐。<=0 回退全局值。
+      gk_accel_vy: 3.5
+      # 近球限速（2026-11-17 重新启用）：追球末段的硬上限，不依赖刹车模型的精度。
+      # 依据 50 号机本轮取证：2.1 m/s 接近时，末段 1.6 m 只需 0.76 s，而该窗口正好被
+      # “odom 位姿冻结 0.9 s + 球位转 LOCAL-MEM 记忆值” 覆盖 → 制动律拿到的距离始终是旧的，
+      # 结果直接撞球（场系球距 0.14 m）。这里把 2.2 m 内的追球速度硬压到 1.0 m/s。
+      # 注：仅在 Chase 生效（StrikerDecide 在 1.10 m 交棒给 Adjust），所以实际作用带是 1.1~2.2 m。
+      limit_near_ball_speed: true
+      near_ball_speed_limit: 1.0
+      near_ball_range: 2.2
       abort_kick_when_ball_moved: true
       ball_out_threshold: 2.0
       cooperation:

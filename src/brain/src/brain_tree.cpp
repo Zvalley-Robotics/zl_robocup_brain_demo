@@ -152,6 +152,12 @@ void BrainTree::initEntry()
     setEntry<string>("decision", "");
     setEntry<string>("defend_decision", "chase");
     setEntry<double>("ball_range", 0);
+    // 球速估计（Brain::updateBallEstimate 每拍覆写）：门将用 vel 预判过线点、用 age 判陈旧
+    setEntry<double>("ball_vel_x", 0.0);
+    setEntry<double>("ball_vel_y", 0.0);
+    setEntry<double>("ball_speed", 0.0);
+    setEntry<double>("ball_age_ms", 1e9);
+    setEntry<bool>("ball_est_valid", false);
 
     setEntry<bool>("gamecontroller_isKickOff", true);
     setEntry<string>("gc_game_state", "");
@@ -836,17 +842,113 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     auto robotPose = brain->data->robotPoseToField;
 
     string curRole = brain->tree->getEntry<string>("player_role");
+    const bool isGk = curRole != "striker";
+
+    // ---- 球速预测（2026-11-16，门将拦截第 1 档）----
+    // data->ball 是最近一次检测的位置，本身没有速度：先把球位按估计速度外推到“现在”，
+    // 再据此求“过拦截线点”，替掉纯几何投影（静止球两者等价，滚动的球投影永远慢半拍）。
+    // 陈旧保护：超过 gk_ball_stale_ms 没有新检测就不再追旧球位（球位记忆里保留的是 1.2 s
+    // 前的点），冻结上次目标原地守门。
+    const double ballAgeMs = brain->msecsSince(brain->data->ball.timePoint);
+    const double staleMs = brain->get_parameter_or("strategy.gk_ball_stale_ms", 500.0);
+    const double predMaxAgeMs = brain->get_parameter_or("strategy.gk_ball_pred_max_age_ms", 400.0);
+    // 预判门限（2026-11-17）：原硬编码 0.35 m/s / TTI<2 s 会漏掉慢速地滚球。
+    // 50 号机日志：t=276 s 球以 1.9 m/s 滚向门，2.44 s 后过线 y=+1.41，门将原地不动 4 s。
+    const double predMinSpeed = brain->get_parameter_or("strategy.gk_pred_min_speed", 0.25);
+    const double predMaxTTI = brain->get_parameter_or("strategy.gk_pred_max_tti_s", 3.5);
+    const bool ballStale = ballAgeMs > staleMs;
+    const bool estValid = brain->tree->getEntry<bool>("ball_est_valid") && ballAgeMs <= predMaxAgeMs;
+    double bvx = 0.0, bvy = 0.0;
+    if (isGk && estValid) {
+        bvx = brain->tree->getEntry<double>("ball_vel_x");
+        bvy = brain->tree->getEntry<double>("ball_vel_y");
+    }
+
+    // 目标时间基准：冻结分支与正常分支都要“消费”本拍，否则解冻后 dt 过大、限幅直接失效。
+    const auto nowTarget = brain->get_clock()->now();
+    double dtTarget = hasLastTarget_ ? (nowTarget - lastTargetTime_).seconds() : 0.0;
+    if (!(dtTarget > 0.0 && dtTarget < 0.3)) dtTarget = 0.0;
+    lastTargetTime_ = nowTarget;
 
     Pose2D targetPose;
-    targetPose.x = curRole == "striker" ? (std::max(- fd.length / 2.0 + distToGoalline, ballPos.x - 1.5))
-            : (- fd.length / 2.0 + distToGoalline);
-    if (ballPos.x + fd.length / 2.0 < distToGoalline) {
-        targetPose.y = curRole == "striker" ? (ballPos.y > 0 ? fd.goalWidth / 2.0 : -fd.goalWidth / 2.0)
-            : (ballPos.y > 0 ? fd.goalWidth / 4.0 : -fd.goalWidth / 4.0);
+    targetPose.x = isGk ? (- fd.length / 2.0 + distToGoalline)
+            : (std::max(- fd.length / 2.0 + distToGoalline, ballPos.x - 1.5));
+
+    if (isGk && ballStale && hasLastTarget_) {
+        // 球位已过期：拿旧位置重算会把门将一路拽向 2~3 s 前的球，改为冻结上次目标。
+        targetPose.x = lastTargetX_;
+        targetPose.y = lastTargetY_;
     } else {
-        targetPose.y = ballPos.y * distToGoalline / (ballPos.x + fd.length / 2.0);
-        targetPose.y = curRole == "striker" ? (cap(targetPose.y, fd.goalWidth / 2.0, -fd.goalWidth / 2.0))
-            : (cap(targetPose.y, fd.penaltyAreaWidth/ 2.0, -fd.penaltyAreaWidth / 2.0));
+        // 球位外推到当前时刻（age 已在上面用 pred_max_age_ms 卡住）；前锋分支保持原样。
+        double bx = ballPos.x, by = ballPos.y;
+        if (isGk) {
+            bx += bvx * (ballAgeMs / 1000.0);
+            by += bvy * (ballAgeMs / 1000.0);
+        }
+
+        const double xLine = - fd.length / 2.0 + distToGoalline;
+        const double ballSpeed = std::hypot(bvx, bvy);
+        bool crossValid = false;
+        double yCross = 0.0;
+        if (isGk && ballSpeed > predMinSpeed && bvx < -0.2 && bx > xLine) {
+            const double tCross = (xLine - bx) / bvx;
+            if (tCross > 0.0 && tCross < predMaxTTI) {
+                yCross = by + bvy * tCross;
+                crossValid = true;
+            }
+        }
+
+        if (isGk) {
+            // 站位点 = 球到两门柱射线的角平分线与拦截线 x=xLine 的交点（2026-11-17）。
+            // 原“球→门心”射线在侧翼会让近柱一侧空出更多（50 号机实测最坏偏差 1.55 m）；
+            // 平分线对两柱是对称的最小最大偏差站位。
+            const double pX = -fd.length / 2.0 - bx;   // 球→门线的 x 分量（本方门在 -x）
+            const double pLy = fd.goalWidth / 2.0 - by;  // 球→左门柱(+y)
+            const double pRy = -fd.goalWidth / 2.0 - by; // 球→右门柱(-y)
+            const double nL = std::hypot(pX, pLy);
+            const double nR = std::hypot(pX, pRy);
+            bool bisectorOk = false;
+            double yBisector = 0.0;
+            if (bx > xLine && nL > 1e-6 && nR > 1e-6) {
+                const double ux = pX / nL + pX / nR;
+                const double uy = pLy / nL + pRy / nR;
+                const double un = std::hypot(ux, uy);
+                if (un > 1e-6 && ux < 0.0) {  // 平分线必须指向本方门
+                    const double s = (xLine - bx) / (ux / un);
+                    yBisector = by + (uy / un) * s;
+                    bisectorOk = std::isfinite(yBisector);
+                }
+            }
+            targetPose.y = bisectorOk ? yBisector
+                : (by > 0 ? fd.goalWidth / 4.0 : -fd.goalWidth / 4.0);
+            targetPose.y = cap(targetPose.y, fd.penaltyAreaWidth / 2.0, -fd.penaltyAreaWidth / 2.0);
+        } else {
+            if (bx + fd.length / 2.0 < distToGoalline) {
+                targetPose.y = by > 0 ? fd.goalWidth / 2.0 : -fd.goalWidth / 2.0;
+            } else {
+                targetPose.y = by * distToGoalline / (bx + fd.length / 2.0);
+                targetPose.y = cap(targetPose.y, fd.goalWidth / 2.0, -fd.goalWidth / 2.0);
+            }
+        }
+        if (crossValid) {
+            // 交点只夹到“门宽 + 0.4 m”：射向门柱外侧的球不追出场；x 锁在拦截线
+            targetPose.y = cap(yCross, fd.goalWidth / 2.0 + 0.4, -(fd.goalWidth / 2.0 + 0.4));
+            targetPose.x = xLine;
+        }
+        if (isGk) {
+            // 目标点速率限幅（2026-11-17）：定位（odom→field）实测每 10 s 跳一次 >0.3 m
+            // （最大 5.38 m），会把目标点整体平移，指令随之反向/空转（实测 cmd vy=-0.40
+            // 只走 -0.02，下一拍又 vx=+0.60 回位）。把目标点变化摊成 ≤ gk_target_track_mps
+            // 的平滑跟随；它同时限制了“预判过线点”的跳变幅度，与门将横移能力同量级。
+            const double trackMps = brain->get_parameter_or("strategy.gk_target_track_mps", 0.6);
+            if (hasLastTarget_ && dtTarget > 1e-3 && trackMps > 0.0) {
+                const double dMax = trackMps * dtTarget;
+                targetPose.y = lastTargetY_ + cap(targetPose.y - lastTargetY_, dMax, -dMax);
+            }
+            lastTargetX_ = targetPose.x;
+            lastTargetY_ = targetPose.y;
+            hasLastTarget_ = true;
+        }
     }
 
     double dist = norm(targetPose.x - robotPose.x, targetPose.y - robotPose.y);
@@ -877,9 +979,53 @@ NodeStatus GoToGoalBlockingPosition::tick() {
     getInput("vy_limit", vyLimit);
     vx = cap(vx, vxLimit, -vxLimit);    
     vy = cap(vy, vyLimit, -vyLimit);    
-    
 
-    brain->client->setVelocity(vx, vy, vtheta);
+    // 定位跳变门（2026-11-17）：odom→field 每 10 s 跳一次 >0.3 m（最大 5.38 m），跳变会让
+    // “机体系目标误差”单拍突变 0.3~0.9 m，而走路每拍只走 <0.02 m。判为跳变时本拍沿用
+    // 上拍指令，不把跳变变成一次反向/空转（50 号机实测 cmd vy=-0.40 实测只走 -0.02，
+    // 下一拍又 vx=+0.60 回位）。持续跳变超 0.35 s 视为真校正，正常采纳。
+    if (isGk) {
+        const double errJump = std::hypot(targetPose_r.x - lastErrX_, targetPose_r.y - lastErrY_);
+        // 只在“上一拍刚跑过”时判跳变：节点刚被重新激活（decision 切换）时误差本来就大，
+        // 那不是定位跳变，不能沿用旧指令。
+        const bool recentCmd = hasLastCmd_ && brain->msecsSince(lastCmdTime_) < 150.0;
+        const bool jumpDetected = recentCmd && errJump > 0.25;
+        if (jumpDetected) {
+            if (!jumping_) {
+                jumping_ = true;
+                jumpStart_ = brain->get_clock()->now();
+            }
+            const bool holdExpired = brain->msecsSince(jumpStart_) > 350.0;
+            if (!holdExpired) {
+                vx = lastCmdVx_;
+                vy = lastCmdVy_;
+                vtheta = lastCmdVtheta_;
+            } else {
+                lastErrX_ = targetPose_r.x;
+                lastErrY_ = targetPose_r.y;
+                lastCmdVx_ = vx;
+                lastCmdVy_ = vy;
+                lastCmdVtheta_ = vtheta;
+                lastCmdTime_ = brain->get_clock()->now();
+                jumping_ = false;
+            }
+        } else {
+            jumping_ = false;
+            lastErrX_ = targetPose_r.x;
+            lastErrY_ = targetPose_r.y;
+            lastCmdVx_ = vx;
+            lastCmdVy_ = vy;
+            lastCmdVtheta_ = vtheta;
+            lastCmdTime_ = brain->get_clock()->now();
+            hasLastCmd_ = true;
+        }
+    }
+    
+    // 门将站位是唯一需要更宽横移的节点：把 XML 的 vy_limit 透传给 setVelocity 覆盖全局
+    // robot.vy_limit（0.4），前锋分支仍走全局上限，不影响其他角色。
+    // accel 同理：全局 1.2 m/s² 从 0 到 0.6 要 0.5 s，门将改走 gk_accel_vy（默认 2.5）。
+    const double gkAccelVy = brain->get_parameter_or("strategy.gk_accel_vy", 2.5);
+    brain->client->setVelocity(vx, vy, vtheta, isGk ? vyLimit : -1.0, isGk ? gkAccelVy : -1.0);
     return NodeStatus::SUCCESS;
 }
 
@@ -1701,25 +1847,21 @@ NodeStatus GoalieDecide::tick()
 
     string newDecision;
     // 出击范围：只有球进入己方罚球区纵深（x < -L/2 + penaltyAreaLength）时才允许离开站位点出击，
-    // 其余时段一律 hold 回位。原判据只看“球离我多近”，球停在中场/边路也能把距离压进 3m 把守门员勾出去，
-    // 形成守门员远离球门追球、球门空门、前锋被压成看戏的问题。
+    // 其余时段一律 hold 回位。原判据只看“球离我多近”，球停在中场/边路也能把距离压进 3m
+    // 把守门员勾出去，形成守门员远离球门追球、球门空门、前锋被压成看戏的问题。
     auto fd = brain->config->fieldDimensions;
     bool ballInDefenseZone = brain->data->ball.posToField.x < -fd.length / 2.0 + fd.penaltyAreaLength;
-    // 近距触发门限（close_threshold，当前配置 2.6m）：球逼到身边时无论防区判据如何都要动（hold 态 0.9 倍滞回，与 chase 一致），
-    // 避免“球已滚到脚边、守门员还站在站位点看”的场景。
-    // 取 2.6 而非更小值的原因：站位到位容差 0.4 + 球在禁区线外沿（x≈-3.85）时，最坏球距 2.05m（GK 可停在 -5.9）；
-    // 2.0 的 hold 门限 1.8 覆盖不到该距离，实测球在威胁位能卡 hold 十几秒不动（E 轮 17s 无响应，前锋代劳清球）。
-    // 球位约束（后场线 = 禁区线外 1m）：close 若只看“球离 GK 的距离”，GK 被球领出去后球滚人追、距离恒 <2.6m，
-    // 会一路追到中线（retreat 门槛 x>0）才回头，实测 GK 追过半场、门前真空、全队涌向球；
-    // 加上“球必须还在己方后场（x < -L/2+penaltyAreaLength+1.0）”后，中场球一律走 hold/retreat 回位。
+    // 近距触发门限 close_threshold：球逼到身边时无论防区判据如何都要动（hold 态 0.9 倍滞回）。
+    // 取 2.6 m：站位容差 0.4 + 球在禁区线外沿时最坏球距 2.05 m，取 2.0 的 hold 门限会卡十几秒。
+    // 还必须要求球在己方后场，否则 GK 被球领出去后距离恒 <2.6 m，会一路追到中线。
     double closeThr = closeThreshold * (lastDecision == "hold" ? 0.9 : 1.0);
     bool ballInCloseZone = brain->data->ball.posToField.x < -fd.length / 2.0 + fd.penaltyAreaLength + 1.0;
     bool ballClose = ballRange <= closeThr && ballInCloseZone;
     bool iKnowBallPos = brain->tree->getEntry<bool>("ball_location_known");
     bool tmBallPosReliable = brain->tree->getEntry<bool>("tm_ball_pos_reliable");
     // 与前锋的球权仲裁（解决“门将和前锋都去抢球”）：取本队最靠近球且消息新鲜的前锋通信球距。
-    // 前锋“贴身清球”阈值是其自身 ball.range<1.0（StrikerDecide GK 区分支），这里加 0.2m 通信滞后余量；
-    // 前锋正在处理球（球距 < 1.2m）时 GK 让位守门（hold），只有当 GK 明显更近（近 0.3m 以上）才接手清球。
+    // 前锋“贴身清球”阈值是自身 ball.range<1.0（StrikerDecide GK 区分支），这里留 0.2m 通信
+    // 滞后余量；前锋在处理球（<1.2m）时 GK 让位守门，只有明显更近（0.3m 以上）才接手清球。
     double strikerBallRange = 1e9;
     for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
         if (i == brain->config->get_player_id() - 1) continue;
@@ -1730,18 +1872,30 @@ NodeStatus GoalieDecide::tick()
     }
     bool strikerOnBall = strikerBallRange < 1.2;
     bool gkCloserThanStriker = ballRange < strikerBallRange - 0.3;
+    // 球位新鲜度门（2026-11-16，拦截第 1 档）：视觉 30 Hz，球被踢走/滚出视野后 data->ball
+    // 仍保留最后一次检测位置（记忆期 1.2 s），拿它进 kick 就是对着旧位置起脚。
+    // 超过 gk_ball_stale_ms 没有新检测时一律回 hold 守门，不做 kick / adjust。
+    const double ballAgeMs = brain->msecsSince(brain->data->ball.timePoint);
+    const double staleMs = brain->get_parameter_or("strategy.gk_ball_stale_ms", 500.0);
+    // 只用球龄判新鲜，不看 data->ballDetected：30 Hz 视觉的单帧掉帧不应让门将掉回 hold。
+    const bool ballFreshEnough = ballAgeMs <= staleMs;
+    const double ballVelX = brain->tree->getEntry<double>("ball_vel_x");
+    const double ballVelY = brain->tree->getEntry<double>("ball_vel_y");
+    const bool ballVelValid = brain->tree->getEntry<bool>("ball_est_valid");
     if (!(iKnowBallPos || tmBallPosReliable))
     {
         newDecision = "find";
+    }
+    else if (!ballFreshEnough)
+    {
+        newDecision = "hold";
     }
     else if (brain->data->ball.posToField.x > 0 - static_cast<double>(lastDecision == "retreat"))
     {
         newDecision = "retreat";
     }
-    // 两级出击触发：
-    //  1) 防区触发：球进罚球区纵深且 ballRange ≤ chase_threshold（3m）；
-    //  2) 近距触发：ballRange ≤ close_threshold（1.5m，见上 ballClose），球在防区外也出击清球。
-    // 滞回与原先 chase 一致：进入 hold 后用 0.9 倍门限退出，防止在临界点反复抖动。
+    // 两级出击触发：① 球进罚球区纵深且 ballRange ≤ chase_threshold；② ballRange ≤
+    // close_threshold（防区外也出击清球）。滞回与 chase 一致：进 hold 后用 0.9 倍门限退出。
     else if (
         (
             !ballInDefenseZone
@@ -1768,7 +1922,20 @@ NodeStatus GoalieDecide::tick()
     }
 
     setOutput("decision_out", newDecision);
-    
+
+    // 1 Hz INFO：门将决策不落盘就无法区分“该 hold 却出击”与“正常清球”（2026-11-16）；
+    // 2026-11-16 补 age/vel：现场要能分开“没看到球（age 大）”与“看到了但速度上限不够”。
+    static rclcpp::Time lastDecideLog = brain->get_clock()->now();
+    if (brain->msecsSince(lastDecideLog) > 1000) {
+        lastDecideLog = brain->get_clock()->now();
+        RCLCPP_INFO(brain->get_logger(),
+            "[gk_decide] decision=%s last=%s ball=(%.2f,%.2f) range=%.2f age=%.0fms vel=(%.2f,%.2f) velOK=%d fresh=%d close=%d defZone=%d strikerRange=%.2f iKnow=%d tmReliable=%d",
+            newDecision.c_str(), lastDecision.c_str(), brain->data->ball.posToField.x, brain->data->ball.posToField.y,
+            ballRange, ballAgeMs, ballVelX, ballVelY, ballVelValid ? 1 : 0, ballFreshEnough ? 1 : 0,
+            ballClose ? 1 : 0, ballInDefenseZone ? 1 : 0, strikerBallRange > 1e8 ? -1.0 : strikerBallRange,
+            iKnowBallPos ? 1 : 0, tmBallPosReliable ? 1 : 0);
+    }
+
     // Publish player_decide message
     brain->visualizer->publishPlayerDecision(format("goalie-%s", newDecision.c_str()));
     
