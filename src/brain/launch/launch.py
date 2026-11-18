@@ -87,7 +87,7 @@ def handle_configuration(context, *args, **kwargs):
     if odom_source == 'autoodom':
         if robot_name:
             raise ValueError('当前 AutoOdom 旁路入口仅支持单机，不可复用到多机命名空间')
-        config['zl_io.odom_topic'] = '/autoodom/selected'
+        config['zl_io.odom_topic'] = '/robot/odometry/odom'
         config['zl_io.odom_convention'] = 'consistent'
         config['zl_io.consistent_odom_scale'] = 1.0
 
@@ -170,7 +170,7 @@ def handle_configuration(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('odom_source', default_value='legacy',
+        DeclareLaunchArgument('odom_source', default_value='autoodom',
                               description='里程计入口：legacy 保留原本体；autoodom 订阅旁路选择器的自洽坐标输出'),
         DeclareLaunchArgument(
             'real_robot', default_value='false',
