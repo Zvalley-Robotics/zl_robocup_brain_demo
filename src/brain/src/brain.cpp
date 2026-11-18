@@ -675,17 +675,9 @@ void Brain::handleCooperation() {
     log_(format("Self: cost: %.1f, isLead: %d", data->tmMyCost, data->tmImLead));
 
 
-    // Process ball position information reported by teammates
-    // 2026-11-10 P0：来源状态机 + 冲突止血 + 贴身 hint。
-    // 原实现只看 ballDetected 就采信，可能拿到队友 ball_memory_timeout 记忆窗里的旧值；
-    // 本机一恢复检测又无条件覆盖回来。两机场系本身差 0.7~1.4 m（定位退化），表现为球位
-    // 在两机之间乒乓（实测 1.2 次/分钟、同刻球位差中位数 0.73 m）。这里加三道闸：
-    //   1) 只有「队友本帧检测到 + 包新鲜(≤tm_ball_lag_max_ms) + 队友自己也认为已知球位」
-    //      才作可靠源；队友自己在用记忆的包不能当检测值用。
-    //   2) 本机有新鲜检测时以本机为准（本机检测更新鲜），与队友值差 >tm_ball_conflict_dist
-    //      记冲突并拒绝采信。
-    //   3) 球位离我 <tm_ball_dist_threshold 或队友自己在用记忆时，只降级为 hint：
-    //      仅驱动转头（CamTrackBall），绝不驱动追球/踢球。
+    // 队友球位来源状态机（不能只看 ballDetected 就采信）：① 队友本帧检测 + 包新鲜 + 队友
+    // 自认已知球位才作可靠源；② 本机新鲜检测优先，差 >tm_ball_conflict_dist 记冲突并拒采信；
+    // ③ 球贴体或队友在用记忆时只降级为 hint（驱动 CamTrackBall 转头，不驱动追球/踢球）。
     static rclcpp::Time lastTmBallPosTime = get_clock()->now();
     const double TM_BALL_TIMEOUT = 1000.;        // reliable 保持时长
     const double TM_BALL_HINT_TIMEOUT = 300.;    // hint 保持时长
@@ -702,6 +694,10 @@ void Brain::handleCooperation() {
     double trustedTmBallLag = 0.;
     int conflictCnt = 0;
     const bool localBallFresh = data->ballDetected && msecsSince(data->ball.timePoint) <= kBallFreshMs;
+    const bool selfCalib = tree->getEntry<bool>("odom_calibrated");
+    // 本地刚确认过球位（detectProcessBalls 的确认锁）：500 ms 内不接受队友覆盖，
+    // 否则 vision 与队友源会继续以帧级频率交替写 data->ball.posToField。
+    const bool localLocked = ballLocalLockUntil.nanoseconds() > 0 && get_clock()->now() < ballLocalLockUntil;
 
     // 最近 alive 队友距离（贴身 hint 的准入条件：两机不近时，“离我 <2 m 的球”更可能是误检）
     double nearestPeerDist = 1e9;
@@ -712,7 +708,9 @@ void Brain::handleCooperation() {
     }
 
     log_(format("Find ball info among %d alive TMs", aliveTmIdxs.size()));
-    for (int i = 0; i < aliveTmIdxs.size(); i++) {
+    // 未完成自定位时（field=odom）本机位姿与对方场系不可比，不参与球位共享：
+    // 本轮 39 号 calib=0 持续 48.8 s、45 号 11.1 s，这段采信会把 odom 系当场地系用。
+    for (int i = 0; selfCalib && i < aliveTmIdxs.size(); i++) {
         int tmIdx = aliveTmIdxs[i];
         auto status = data->tmStatus[tmIdx];
         const double lag = msecsSince(status.timeLastCom);
@@ -753,7 +751,7 @@ void Brain::handleCooperation() {
 
         tree->setEntry<bool>("tm_ball_pos_reliable", true);
         lastTmBallPosTime = get_clock()->now();
-        if (!tree->getEntry<bool>("ball_location_known")) { // If I have forgotten, but the teammate's information is reliable, update my memory of the ball's position with the teammate's information.
+        if (!tree->getEntry<bool>("ball_location_known") && !localLocked) { // If I have forgotten, but the teammate's information is reliable, update my memory of the ball's position with the teammate's information.
             log_("update ball.posToField");
             data->ball.posToField = data->tmBall.posToField;
             updateRelativePos(data->ball);
@@ -775,7 +773,30 @@ void Brain::handleCooperation() {
             ballPosFromTeammate = false;
             ballPosHandoffTime = get_clock()->now();
         }
+        // 队友源随可靠标志一起失效：1 s 内没任何可信源时，不能继续把"过期队友值"当来源
+        // （本轮实测 45 号有 20 条 src=TM 但 tm=0、range=1e6，日志误导且仍在用旧值）
+        if (ballPosFromTeammate && !localBallFresh &&
+            !tree->getEntry<bool>("tm_ball_pos_reliable")) {
+            ballPosFromTeammate = false;
+            ballPosHandoffTime = get_clock()->now();
+        }
     }
+
+    // 本体误识别观测（只统计，不参与决策）：本机球位贴体且与“本帧检测到球的队友”球位差
+    // 超阈值时置 ball_self_suspect，供视觉侧量化误识别率；行为上仍按本机优先。
+    bool selfBodySuspect = false;
+    if (localBallFresh && data->ball.range < SELF_BODY_RANGE) {
+        for (int i = 0; i < aliveTmIdxs.size(); i++) {
+            auto &st = data->tmStatus[aliveTmIdxs[i]];
+            if (!st.isAlive || !st.ballDetected || msecsSince(st.timeLastCom) > TM_LAG_MAX) continue;
+            if (norm(st.ballPosToField.x - data->ball.posToField.x,
+                     st.ballPosToField.y - data->ball.posToField.y) > SELF_BODY_OVERRIDE_DIFF) {
+                selfBodySuspect = true;
+                break;
+            }
+        }
+    }
+    tree->setEntry<bool>("ball_self_suspect", selfBodySuspect);
 
     // 贴身 hint：只更新 tmBall（供 CamTrackBall 转头），绝不碰 data->ball
     if (hintTMIdx >= 0) {
@@ -796,15 +817,21 @@ void Brain::handleCooperation() {
     static rclcpp::Time lastTmBallLog = get_clock()->now();
     if (msecsSince(lastTmBallLog) > 1000) {
         lastTmBallLog = get_clock()->now();
-        RCLCPP_INFO(get_logger(), "[tmball] src=%s tm=%d lag=%.0fms dist=%.2f range=%.2f hint=%d conflict=%d localFresh=%d peerSep=%.2f guard=%d",
-            ballPosFromTeammate ? "TM" : "LOCAL",
+        // 1 Hz INFO：现场区分“没共享”/“共享了但被拒”/“冲突”/“没有有效球源”
+        const char *srcName = ballPosFromTeammate ? "TM"
+            : (localBallFresh ? "LOCAL"
+            : (tree->getEntry<bool>("ball_location_known") ? "LOCAL-MEM" : "NONE"));
+        RCLCPP_INFO(get_logger(), "[tmball] src=%s tm=%d lag=%.0fms dist=%.2f range=%.2f hint=%d conflict=%d localFresh=%d peerSep=%.2f guard=%d calib=%d suspect=%d",
+            srcName,
             trustedTMIdx >= 0 ? trustedTMIdx + 1 : (hintTMIdx >= 0 ? hintTMIdx + 1 : 0),
             trustedTmBallLag, trustedTmBallDist, trustedTMIdx >= 0 ? minRange : hintMinRange,
-            tmBallHintAlive ? 1 : 0, conflictCnt, localBallFresh ? 1 : 0, nearestPeerDist, ballSrcGuard ? 1 : 0);
+            tmBallHintAlive ? 1 : 0, conflictCnt, localBallFresh ? 1 : 0, nearestPeerDist, ballSrcGuard ? 1 : 0,
+            selfCalib ? 1 : 0, selfBodySuspect ? 1 : 0);
     }
 
     bool isAgentMode = get_parameter(GAME_AGENT_MODE_PARAM).as_bool();
-    // Based on the number of players on the field (referee data is more accurate), decide whether the goal_keeper should switch to striker
+    // Based on the number of players on the field (referee data is more accurate),
+    // decide whether the goal_keeper should switch to striker
     bool switchRole = config->get_enable_role_switch();
 
     // In agent mode, there is no referee, so do not switch roles
@@ -2153,19 +2180,36 @@ void Brain::detectProcessBalls(const vector<GameObject> &ballObjs)
 
     if (indexRealBall >= 0)
     { // Ball detected
-        data->ballDetected = true;
+        ballLocalDetectStreak++;
+        // 球位写入互斥：vision(30 Hz) 与队友覆盖写同一字段（tick 86 Hz），无互斥时会出现
+        // 12 ms 级交替跳变。须连续 BALL_LOCAL_CONFIRM_FRAMES 帧检测才切回本地，且其后
+        // BALL_LOCAL_LOCK_S 内禁止队友再覆盖（防反向抖动）。
+        const bool localTakeover = !ballPosFromTeammate ||
+            ballLocalDetectStreak >= BALL_LOCAL_CONFIRM_FRAMES;
+        if (localTakeover)
+        {
+            if (ballPosFromTeammate)
+            {
+                ballPosFromTeammate = false;
+                ballPosHandoffTime = now;
+            }
+            ballLocalLockUntil = now + rclcpp::Duration::from_seconds(BALL_LOCAL_LOCK_S);
 
-        data->ball = ballObjs[indexRealBall];
-        data->ball.confidence = bestConfidence;
+            data->ballDetected = true;
 
-        tree->setEntry<bool>("ball_location_known", true);
-        updateBallOut();
-        
-        lastSeenRealBallTime = now;
-        data->lose_ball = false;
+            data->ball = ballObjs[indexRealBall];
+            data->ball.confidence = bestConfidence;
+
+            tree->setEntry<bool>("ball_location_known", true);
+            updateBallOut();
+
+            lastSeenRealBallTime = now;
+            data->lose_ball = false;
+        }
     }
     else
     { // No ball detected
+        ballLocalDetectStreak = 0;
         data->ballDetected = false;
         data->ball.boundingBox.xmin = 0;
         data->ball.boundingBox.xmax = 0;

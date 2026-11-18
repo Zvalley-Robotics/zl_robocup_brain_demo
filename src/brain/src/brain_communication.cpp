@@ -398,9 +398,13 @@ void BrainCommunication::unicastCommunication() {
 
         msg.isAlive = brain->data->tmImAlive;
         msg.isLead = brain->data->tmImLead;
-        msg.ballDetected = brain->data->ballDetected;
-        msg.ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known");
-        msg.ballConfidence = brain->data->ball.confidence;
+        // 未完成自定位时（field=odom）：球位/位姿都不在场地系，不能作为对方的可靠源。
+        // 这里把球相关字段降级为“本机不知道”，让对方走自己的检测/找球，
+        // 而不是把 odom 系坐标当场地系球位用（实机 calib=0 曾持续 11~49 s）。
+        const bool calibOk = brain->tree->getEntry<bool>("odom_calibrated");
+        msg.ballDetected = brain->data->ballDetected && calibOk;
+        msg.ballLocationKnown = brain->tree->getEntry<bool>("ball_location_known") && calibOk;
+        msg.ballConfidence = calibOk ? brain->data->ball.confidence : 0.0;
         msg.ballRange = brain->data->ball.range;
         msg.cost = brain->data->tmMyCost;
         msg.ballPosToField = brain->data->ball.posToField;

@@ -474,6 +474,19 @@ private:
     rclcpp::Time lastTmBallHintTime;
 
     // ------------------------------------------------------ agent related ------------------------------------------------------
+    // 球位写入互斥：本地检测与队友共享都写 data->ball.posToField，无互斥时 vision(30Hz)
+    // 与 tick(86Hz) 会交替覆盖（实测 12ms 级、2~4 m 跳变）。队友源生效期间必须连续
+    // BALL_LOCAL_CONFIRM_FRAMES 帧本地检测才夺回；夺回后 BALL_LOCAL_LOCK_S 内禁止队友再覆盖。
+    int ballLocalDetectStreak = 0;
+    rclcpp::Time ballLocalLockUntil;
+    static constexpr int BALL_LOCAL_CONFIRM_FRAMES = 3;
+    static constexpr double BALL_LOCAL_LOCK_S = 0.5;
+
+    // 本体误识别护栏：视觉把自身腿/手误识别为球时 cost 极低（球距≈0.26 m），会带偏 lead/
+    // 让位/冲突仲裁。brain 层拿不到连杆位置，几何判据无法区分“自己的腿”与“贴脚的真球”，
+    // 故本体剔除交视觉侧；这里只留 ball_self_suspect 观测标记（只统计不动作）。
+    static constexpr double SELF_BODY_RANGE = 0.5;          // 本机球距小于该值才怀疑贴体
+    static constexpr double SELF_BODY_OVERRIDE_DIFF = 1.5;  // 与队友球位差大于该值时改信队友
 
     // ----- 丢球扫场相位（见 findSweepTarget）-----
     bool findSweepActive = false;

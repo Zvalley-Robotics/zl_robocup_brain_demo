@@ -162,12 +162,9 @@ brain_node:
 
     strategy:
       ball_confidence_threshold: 50.0
-      # 球位记忆时长（s）：超过即 ball_location_known=false，决策转入找球。
-      # 2026-10-28：2.0 → 0.5（避免踢球后“以为球还在脚下”）。
-      # 2026-10-30：0.5 → 1.2。CamTrackBall 的“丢球后继续朝最后方向转头”宽限期
-      # 受该值门控：known=false 时行为树直接切 CamFindBall，宽限期再长也用不上。
-      # “以为球在脚下”的主要危害已由另两道门控堵住：上报/踢球用 kBallFreshMs=300ms，
-      # CamTrackBall 近距球（<0.6m）300ms 内就停止压头。
+      # 球位记忆时长（s）：超过即 ball_location_known=false，决策转入找球。该值同时门控
+      # CamTrackBall 的“丢球后继续朝最后方向转头”宽限期，过小会让宽限期失效；主要危害
+      # 已由 kBallFreshMs=300ms 的新鲜窗堵住，故不再取更小值（曾取 0.5）。
       ball_memory_timeout: 1.2
       tm_ball_dist_threshold: 2.0
       # 队友球位共享（2026-11-10 P0）：
@@ -306,12 +303,9 @@ brain_node:
 
     enable_com: true
 
-    # 队内通信画像（2026-11-11 从 config_local.yaml 回收到基线）。
-    # 原先只在 config_local.yaml 里写该键、config.yaml 完全没有，结果是某台机漏同步
-    # config_local 时会静默回落代码默认 false，多机通信退化成单实例且无任何报错。
-    #   multi_instance=true ：队友表按 playerId 建键、每人独立单播端口
-    #   （30000+teamId+playerId）；单机同跑多台 brain 必须，真机分机部署同样兼容
-    #   （各绑自己端口），单台运行无副作用。单实例旧行为改为 false 即回退。
+      # 队内通信画像（原先只在 config_local.yaml，某台机漏同步会静默回落 false，多机通信
+      # 退化成单实例且无报错）。true = 队友表按 playerId 建键、每人独立单播端口
+      # （30000+teamId+playerId）；单机同跑多台 brain 必须，真机分机部署同样兼容。
     comm:
       multi_instance: true
 
