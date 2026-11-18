@@ -566,6 +566,9 @@ void Brain::tick()
 
     tree->tick();
 
+    // 头部指令收口（2026-11-17）：本拍所有节点的 requestHead 在这里仲裁后只下发一次。
+    // 必须放在 tree->tick() 之后：请求是行为树节点产生的，早于它的位置拿到的都是上一拍请求。
+    client->flushHead();
     // 上报本 tick 实际执行的行为树策略链（UI 展示用；变更时发布 + 2s 心跳）
     publishBrainStrategy();
 }
@@ -1429,6 +1432,56 @@ double Brain::msecsSince(rclcpp::Time time)
     auto now = this->get_clock()->now();
     if (time.get_clock_type() != now.get_clock_type()) return 1e18;
     return (now - time).nanoseconds() / 1e6;
+}
+
+double Brain::findSweepIntervalMs()
+{
+    const double ms = get_parameter_or<double>("robot.head_sweep_interval_ms", 550.0);
+    return std::max(500.0, ms);
+}
+
+void Brain::findSweepTarget(double &pitch, double &yaw)
+{
+    // 丢球扫场的唯一目标来源（CamFindBall / CamFastScan 共用，2026-11-17）。
+    // 点位顺序：高位中 → 高位左 → 高位右 → 中位右 → 低位中 → 低位左。
+    // 先抬头看远处（球被踢走后大概率在 2~6 m），最后才低头确认脚下；
+    // 旧顺序是「低 3 格 → 高 3 格」，丢球后前 3 格相机一直对着地面（pitch=1.0 时
+    // 地面可视只有 ~0.5 m），正好错过刚被踢出去的球。
+    static constexpr double kSweep[kFindSweepCount][2] = {
+        {0.22, 0.0},   // 高位中（新头 11°~61° 下俯，0.20 是硬限位，取 0.22 留余量）
+        {0.22, 1.1},   // 高位左（yaw 正=左；±1.1 与 head_yaw_limit 一致，已是满行程）
+        {0.22, -1.1},  // 高位右
+        {0.60, -1.1},  // 中位右
+        {1.00, 0.0},   // 低位中
+        {1.00, 1.1},   // 低位左
+    };
+
+    const double nowMs = get_clock()->now().seconds() * 1000.0;
+    const double intervalMs = findSweepIntervalMs();
+
+    // 相位由「距本轮开始的时间」决定，两个调用者在同一拍内拿到完全相同的目标
+    //（旧实现各自维护 _cmdIndex，700/550 ms 两套节拍必然错位）。
+    // 中间被别的来源占头超过 2 个节拍则视为新一轮，从 0 号点重新开始
+    // （对应旧 CamFindBall 的 restart 语义：切走再回来不能接着扫后半段）。
+    if (!findSweepActive || nowMs - findSweepLastReqMs > 2.0 * intervalMs)
+    {
+        findSweepStartMs = nowMs;
+        findSweepActive = true;
+    }
+    findSweepLastReqMs = nowMs;
+
+    const int idx = static_cast<int>((nowMs - findSweepStartMs) / intervalMs) % kFindSweepCount;
+    pitch = kSweep[idx][0];
+    yaw = kSweep[idx][1];
+
+    // 0 号点优先朝「最后一次看到球的方向」（5 s 内有效），而不是固定正前方：
+    // 丢球后 yawToRobot 仍随位姿更新，看一眼最后方位比盲扫正前更容易立刻找回球。
+    if (idx == 0 && !data->ballDetected)
+    {
+        const double ballAgeSec = msecsSince(data->ball.timePoint) / 1000.0;
+        if (ballAgeSec <= 5.0 && std::isfinite(data->ball.yawToRobot))
+            yaw = cap(data->ball.yawToRobot, 1.1, -1.1);
+    }
 }
 
 rclcpp::Time Brain::timePointFromHeader(std_msgs::msg::Header header) {

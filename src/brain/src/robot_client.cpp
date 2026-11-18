@@ -19,6 +19,12 @@ void RobotClient::init(const std::string & robot_name)
     zl = std::make_unique<robot_io::ZlIo>(brain);
     zl->init();
 
+    // 头部仲裁参数（brain.cpp 中 declare_parameter，config.yaml 可覆盖）。
+    // stale：节点被 halt 后不再 tick，多久算“不再请求”（200 ms ≈ 20 拍，覆盖 tick 抖动）；
+    // dedup：与上一条已下发目标的死区，小于它不重发（板端每条消息都会重设 0.5 s 插值斜坡）。
+    _headStaleMs = brain->get_parameter_or<double>("robot.head_arb_stale_ms", 200.0);
+    _headDedupRad = brain->get_parameter_or<double>("robot.head_arb_dedup_rad", 0.01);
+
     // 原先由 bridge 工作区的两个独立节点承担，现收进 brain 进程。
     kick_targets = std::make_unique<robot_io::KickTargets>(brain);
     kick_targets->init();
@@ -37,7 +43,18 @@ void RobotClient::tick()
         brain->now().seconds());
 }
 
+bool RobotClient::kickTargetsActive() const
+{
+    return kick_targets && kick_targets->active(brain->now().seconds());
+}
+
 int RobotClient::moveHead(double pitch, double yaw)
+{
+    // 保留旧签名给 MoveHead 节点：行为树显式指定的姿态优先级最高，且允许立即接管。
+    return requestHead(HeadSource::Explicit, pitch, yaw, 0.0);
+}
+
+int RobotClient::requestHead(HeadSource src, double pitch, double yaw, double minHoldMs)
 {
     // 上游（头部位姿/图像偏差）偶发 NaN/Inf：直接丢弃该帧，保持上一帧头部姿态。
     if (!std::isfinite(pitch) || !std::isfinite(yaw))
@@ -46,17 +63,99 @@ int RobotClient::moveHead(double pitch, double yaw)
         return -1;
     }
 
-    const double rawPitch = pitch, rawYaw = yaw; // 限幅前的原始指令
-    yaw = cap(yaw, brain->config->get_head_yaw_limit_left(), brain->config->get_head_yaw_limit_right());
+    const int idx = static_cast<int>(src);
+    if (idx <= 0 || idx >= kHeadSourceCount)
+    {
+        brain->log->warn("move_head", format("非法头部来源 %d，已丢弃", idx));
+        return -1;
+    }
+
+    HeadRequest &req = _headReq[idx];
+    req.valid = true;
+    req.pitch = pitch;
+    req.yaw = yaw;
+    req.stamp = brain->get_clock()->now();
+    req.minHoldMs = minHoldMs;
+    return 0;
+}
+
+void RobotClient::flushHead()
+{
+    const auto now = brain->get_clock()->now();
+
+    // 1) 作废过期请求：节点被 _while 判假/halt 后不再 tick，不能继续占着出口。
+    //    一次遍历同时挑出最高优先级（枚举值最大）的存活来源。
+    int best = static_cast<int>(HeadSource::None);
+    for (int i = 1; i < kHeadSourceCount; ++i)
+    {
+        if (!_headReq[i].valid)
+            continue;
+        if (brain->msecsSince(_headReq[i].stamp) > _headStaleMs)
+        {
+            _headReq[i].valid = false;
+            continue;
+        }
+        if (i > best)
+            best = i;
+    }
+    if (best == static_cast<int>(HeadSource::None))
+    {
+        _headOwner = 0;  // 无人请求：保持上一姿态（与旧行为一致，不主动回中）
+        return;
+    }
+
+    // 2) 抢占规则：高优先级立即抢；同级/更低必须等当前持有者驻留期满且它已不再请求。
+    //    这条是本轮修复的核心——两套 6 点扫描同拍请求时也只有一个在动，不会 550/700 ms 交替。
+    if (_headOwner != 0 && best != _headOwner)
+    {
+        const bool ownerAlive = _headReq[_headOwner].valid;
+        const bool byPriority = best > _headOwner;
+        const bool afterHold =
+            !ownerAlive && brain->msecsSince(_headOwnerSince) >= _headOwnerMinHoldMs;
+        if (!byPriority && !afterHold)
+        {
+            if (!ownerAlive)
+                return;  // 老持有者已不请求但驻留期未满：本拍不下发
+            best = _headOwner;
+        }
+    }
+
+    const HeadRequest &r = _headReq[best];
+    if (best != _headOwner)
+    {
+        // 切换留痕（debug 级，仅在换手时打一条）：现场用它区分“谁在动头”。
+        brain->log->debug("move_head", format("来源切换 %d -> %d (minHold %.0fms)",
+                                             _headOwner, best, r.minHoldMs));
+        _headOwner = best;
+        _headOwnerSince = now;
+    }
+    _headOwnerMinHoldMs = r.minHoldMs;
+
+    // 3) 限幅（与旧 moveHead 完全一致，保证实机行为不变）
+    const double rawPitch = r.pitch, rawYaw = r.yaw;  // 限幅前的原始指令
+    double yaw = cap(r.yaw, brain->config->get_head_yaw_limit_left(),
+                     brain->config->get_head_yaw_limit_right());
     // pitch 是「相机光轴下俯角」（zl 侧按 head_pitch_offset_deg 换算成关节角）。
     // 双向限幅到新头硬件的物理可达区间（约 0.20~1.06 rad = 11°~61° 下俯）：
     // 更小会被机械限位挡住并让 head_pose 与实际不符，更大同样会顶到限位。
-    pitch = cap(pitch, brain->config->get_head_pitch_limit_down(), brain->config->get_head_pitch_limit_up());
+    double pitch = cap(r.pitch, brain->config->get_head_pitch_limit_down(),
+                       brain->config->get_head_pitch_limit_up());
 
-    brain->log->debug("move_head", format("pitch: %.2f -> %.2f, yaw: %.2f -> %.2f", rawPitch, pitch, rawYaw, yaw));
+    // 4) 去重：与上一条已下发目标几乎相同就不重发。板端 external_node 对每条消息都
+    //    重设 0.5 s 线性插值斜坡（起点=当前实测位置），重复发同一目标会让斜坡永远走不完。
+    if (_headPubValid && std::fabs(pitch - _headPubPitch) < _headDedupRad &&
+        std::fabs(yaw - _headPubYaw) < _headDedupRad)
+    {
+        return;
+    }
+
+    brain->log->debug("move_head", format("src=%d pitch: %.2f -> %.2f, yaw: %.2f -> %.2f",
+                                          best, rawPitch, pitch, rawYaw, yaw));
 
     zl->sendHead(pitch, yaw);
-    return 0;
+    _headPubPitch = pitch;
+    _headPubYaw = yaw;
+    _headPubValid = true;
 }
 
 int RobotClient::standUp()

@@ -133,6 +133,16 @@ public:
 
     double msecsSince(rclcpp::Time time);
 
+    // 丢球扫场（2026-11-17）：CamFindBall 与 CamFastScan 共用同一份点位/节拍/相位，
+    // 由 findSweepTarget 按「距本轮开始的时间」给出当前目标；再经单一出口去重。
+    static constexpr int kFindSweepCount = 6;
+
+    /** 扫场每点驻留时长（ms，参数 robot.head_sweep_interval_ms，内部夹到 ≥500）。 */
+    double findSweepIntervalMs();
+
+    /** 当前扫场目标（相机光轴语义，弧度）。每拍可重复调用，同拍内结果一致。 */
+    void findSweepTarget(double &pitch, double &yaw);
+
     bool isFreekickStartPlacing();
 
     rclcpp::Time timePointFromHeader(std_msgs::msg::Header header);
@@ -422,6 +432,12 @@ private:
     rclcpp::Time lastTmBallHintTime;
 
     // ------------------------------------------------------ agent related ------------------------------------------------------
+
+    // ----- 丢球扫场相位（见 findSweepTarget）-----
+    bool findSweepActive = false;
+    double findSweepStartMs = 0.0;   // 本轮扫描起点（ms，墙钟）
+    double findSweepLastReqMs = 0.0; // 最近一次取目标时刻（判“中间被别人占头”用）
+
     // In agent mode, subscribe to parameter changes and handle callbacks
     std::shared_ptr<rclcpp::ParameterEventHandler> param_subscriber_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> team_id_handle_;

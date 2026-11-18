@@ -402,43 +402,16 @@ NodeStatus CamTrackBall::tick()
         yaw = brain->data->headYaw - deltaYaw;
     }
 
-    brain->client->moveHead(pitch, yaw);
+    // 跟球是连续量（每 100 ms 节流后一帧），minHold 传 0：一旦球有了新观测就该立即可跟。
+    brain->client->requestHead(HeadSource::TrackBall, pitch, yaw, 0.0);
     lastSendTime = brain->get_clock()->now();
     return NodeStatus::SUCCESS;
 }
 
 CamFindBall::CamFindBall(const string &name, const NodeConfig &config, Brain *_brain) : SyncActionNode(name, config), brain(_brain)
 {
-    double lowPitch = 1.0;
-    double midPitch = 0.6;
-    double highPitch = 0.22; // 高位取光轴最抬头附近（新头 11°~61° 下俯，下限 0.20）
-    double leftYaw = 1.1;
-    double rightYaw = -1.1;
-
-    // 先抬头看远处（球被踢走后大概率在 2~6 m），最后才低头确认脚下。
-    // 旧顺序是“低 3 格 → 高 3 格”，丢球后前 3 s 相机一直对着地面
-    // （pitch=1.0 时地面可视只有 ~0.5 m），正好错过刚被踢出去的球。
-    _cmdSequence[0][0] = highPitch;
-    _cmdSequence[0][1] = 0;
-    _cmdSequence[1][0] = highPitch;
-    _cmdSequence[1][1] = leftYaw;
-    _cmdSequence[2][0] = highPitch;
-    _cmdSequence[2][1] = rightYaw;
-    _cmdSequence[3][0] = midPitch;
-    _cmdSequence[3][1] = rightYaw;
-    _cmdSequence[4][0] = lowPitch;
-    _cmdSequence[4][1] = 0;
-    _cmdSequence[5][0] = lowPitch;
-    _cmdSequence[5][1] = leftYaw;
-
-    _cmdIndex = 0;
-    // 2026-10-30: 1000 → 700 ms。本体头部 ~0.5 s 收敛，1 s 中有近一半是空等；
-    // 700 ms 可覆盖一轮 6 点 ≈ 4.2 s（原 6.0 s）。
-    _cmdIntervalMSec = 700;
-    // 重新进入节点超过 2 个节拍即视为新一轮扫描，必须从 [0] 开始（原来 60 s 才重置，
-    // 中途切走再回来会接着扫后半段，导致“朝最后球方向看第一眼”形同虚设）。
-    _cmdRestartIntervalMSec = _cmdIntervalMSec * 2;
-    _timeLastCmd = brain->get_clock()->now();
+    // 2026-11-17: 6 点序列/节拍已搬到 Brain::findSweepTarget()（与 CamFastScan 共用同一相位），
+    // 否则两者同拍各发一套目标，头部在两套满行程端点间被反复反向拉扯（实机剧烈晃头）。
 }
 
 NodeStatus CamFindBall::tick()
@@ -448,36 +421,11 @@ NodeStatus CamFindBall::tick()
         return NodeStatus::SUCCESS;
     } // Currently, all nodes return Success. Returning Failure would affect the execution of subsequent nodes.
 
-    auto curTime = brain->get_clock()->now();
-    auto timeSinceLastCmd = (curTime - _timeLastCmd).nanoseconds() / 1e6;
-    if (timeSinceLastCmd < _cmdIntervalMSec)
-    {
-        return NodeStatus::SUCCESS;
-    } // Not yet time for the next command
-    else if (timeSinceLastCmd > _cmdRestartIntervalMSec)
-    {                  // Exceeded a certain time, consider this as restarting from the beginning
-        _cmdIndex = 0; // Note that we don't return here
-    }
-    else
-    { // Reached the time, execute the next command, also do not return
-        _cmdIndex = (_cmdIndex + 1) % (sizeof(_cmdSequence) / sizeof(_cmdSequence[0]));
-    }
-
-    // 新一轮扫描优先朝“最后一次看到球的方向”抬头（球的 yawToRobot 在失球后
-    // 仍会随位姿更新），而不是固定从正前方开始；5 s 内没看到过球则退回正前。
-    if (_cmdIndex == 0)
-    {
-        double yaw0 = 0.0;
-        const double ballAgeSec = brain->msecsSince(brain->data->ball.timePoint) / 1000.0;
-        if (ballAgeSec <= 5.0 && std::isfinite(brain->data->ball.yawToRobot))
-        {
-            yaw0 = cap(brain->data->ball.yawToRobot, 1.1, -1.1);
-        }
-        _cmdSequence[0][1] = yaw0;
-    }
-
-    brain->client->moveHead(_cmdSequence[_cmdIndex][0], _cmdSequence[_cmdIndex][1]);
-    _timeLastCmd = brain->get_clock()->now();
+    // 目标由 Brain::findSweepTarget 统一给出（与 CamFastScan 同源同相位）。
+    // minHold 传一个点位驻留时长：驻留期内同级/更低优先级（含另一套扫描）抢不走出口。
+    double pitch, yaw;
+    brain->findSweepTarget(pitch, yaw);
+    brain->client->requestHead(HeadSource::FindBall, pitch, yaw, brain->findSweepIntervalMs());
     return NodeStatus::SUCCESS;
 }
 
@@ -508,7 +456,8 @@ NodeStatus CamScanField::tick()
     }
     _lastScanSendSec = sec;
 
-    brain->client->moveHead(pitch, yaw);
+    // 优先级最低：一旦有球/需要找球，会被立刻抢走（不需要等驻留期）。
+    brain->client->requestHead(HeadSource::ScanField, pitch, yaw, sendIntervalMsec);
     return NodeStatus::SUCCESS;
 }
 
@@ -2201,11 +2150,13 @@ NodeStatus RLVisionKick::onRunning()
     }
     
     if (_visionKickStarted) {
+        // 踢球前的两段低头，优先级高于追球/扫描（否则会被 CamTrackBall 的 100 ms 更新抹掉）；
+        // minHold 取两段各自的时长，防止另一来源在两段之间插队造成反复。
         double headMsec = brain->msecsSince(_headScanStartTime);
         if (headMsec < 300.0) {
-            brain->client->moveHead(0.4, 0.0);
+            brain->client->requestHead(HeadSource::VisionKick, 0.4, 0.0, 300.0);
         } else if (headMsec < 550.0) {
-            brain->client->moveHead(0.7, 0.0);
+            brain->client->requestHead(HeadSource::VisionKick, 0.7, 0.0, 250.0);
         }
     }
 
@@ -2358,26 +2309,23 @@ void RobotFindBall::onHalted()
 
 NodeStatus CamFastScan::onStart()
 {
-    _cmdIndex = 0;
-    _timeLastCmd = brain->get_clock()->now();
-    brain->client->moveHead(_cmdSequence[_cmdIndex][0], _cmdSequence[_cmdIndex][1]);
+    _startTime = brain->get_clock()->now();
+    // 首拍即请求（目标来自 Brain::findSweepTarget，与 CamFindBall 同相位）
+    double pitch, yaw;
+    brain->findSweepTarget(pitch, yaw);
+    brain->client->requestHead(HeadSource::FindBall, pitch, yaw, brain->findSweepIntervalMs());
     return NodeStatus::RUNNING;
 }
 
 NodeStatus CamFastScan::onRunning()
 {
-    double interval = getInput<double>("msecs_interval").value();
-    if (brain->msecsSince(_timeLastCmd) < interval) return NodeStatus::RUNNING;
+    // 一轮 = 6 个点位，扫完把控制权交回 FindBall 序列（TurnOnSpot / GoToReadyPosition）
+    if (brain->msecsSince(_startTime) >= Brain::kFindSweepCount * brain->findSweepIntervalMs())
+        return NodeStatus::SUCCESS;
 
-    // else 
-    // 序列点数与 _cmdSequence 自动同步（点数为 N 时最后一个索引是 N-1）
-    constexpr int kCmdCount = sizeof(_cmdSequence) / sizeof(_cmdSequence[0]);
-    if (_cmdIndex >= kCmdCount - 1) return NodeStatus::SUCCESS;
-
-    // else
-    _cmdIndex++;
-    _timeLastCmd = brain->get_clock()->now();
-    brain->client->moveHead(_cmdSequence[_cmdIndex][0], _cmdSequence[_cmdIndex][1]);
+    double pitch, yaw;
+    brain->findSweepTarget(pitch, yaw);
+    brain->client->requestHead(HeadSource::FindBall, pitch, yaw, brain->findSweepIntervalMs());
     return NodeStatus::RUNNING;
 }
 
@@ -2391,11 +2339,8 @@ NodeStatus TurnOnSpot::onStart()
     _angle = getInput<double>("rad").value();
     getInput("towards_ball", towardsBall);
     if (towardsBall) {
-        // 原来用 bbox 中心判方向，但失球时 bbox 已被清零 → ballPixX=0 →
-        // 永远朝同一侧转，表现为原地反复打转。改为：
-        //   1) 5 s 内看到过球 → 朝最后球方位转；
-        //   2) 本帧有检测但无有效方位 → 用 bbox 中心；
-        //   3) 完全未知 → 左右交替，避免总是同向。
+        // 原来用 bbox 中心判方向，失球时框被清零 → ballPixX=0 → 永远朝同一侧转（原地反复打转）。
+        // 改为：5 s 内见过球→朝最后方位；本帧有框→用框中心；完全未知→左右交替。
         double turnSign = 1.0;
         const double ballAgeSec = brain->msecsSince(brain->data->ball.timePoint) / 1000.0;
         if (ballAgeSec <= 5.0 && std::isfinite(brain->data->ball.yawToRobot)
@@ -2551,6 +2496,7 @@ NodeStatus MoveHead::tick()
     double pitch, yaw;
     getInput("pitch", pitch);
     getInput("yaw", yaw);
+    // 行为树显式指定的姿态：最高优先级（moveHead 内部转成 HeadSource::Explicit）。
     brain->client->moveHead(pitch, yaw);
     return NodeStatus::SUCCESS;
 }

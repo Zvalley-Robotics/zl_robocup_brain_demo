@@ -10,6 +10,26 @@
 class Brain;  // Mutually dependent classes; forward declaration
 
 /**
+ * 头部指令来源（2026-11-17）。枚举值即优先级，数值越大越优先。
+ *
+ * 同一拍内只有一个来源能成为“当前持有者”，其余请求直接丢弃——头部从「各节点直发」
+ * 改为单一出口。背景：丢球时 CamFindBall（700 ms 6 点）与 FindBall 子树里的
+ * CamFastScan（550 ms 6 点）挂在同一个 ReactiveSequence 下，每拍都会先后下发两套
+ * 完全不同的目标姿态；板端 external_node 每收到一条消息都把 0.5 s 线性插值斜坡从头
+ * 重来，于是头部在两个满行程端点（yaw ±1.1 rad）之间反复反向，实机表现为剧烈晃头。
+ * 速度链早有 setVelocity 单一出口 + 全局加速度限幅，头部此前完全没有。
+ */
+enum class HeadSource : int
+{
+    None = 0,        // 无请求（内部占位，不得作为请求来源）
+    ScanField = 1,   // CamScanField：未定位时巡视场地线，可被任何找球动作打断
+    FindBall = 2,    // CamFindBall / CamFastScan：丢球后的 6 点扫场（两者点位已同源）
+    TrackBall = 3,   // CamTrackBall：看见球或宽限期内朝最后已知位置收敛
+    VisionKick = 4,  // RLVisionKick：踢球前低头两段，时间敏感
+    Explicit = 5,    // MoveHead：行为树显式指定姿态（READY 抬头看场地线等）
+};
+
+/**
  * `RobotClient` contains all robot-body operations used by the Brain.
  *
  * 2026-11-03 起本类直接对接 zl_robot 原生接口（取代 brain_zl_bridge 进程）：
@@ -32,6 +52,26 @@ public:
      * @return int , 0 indicates success
      */
     int moveHead(double pitch, double yaw);
+
+    /**
+     * @brief 头部指令唯一入口（2026-11-17）：只登记请求，真正的下发由 tick() 里的
+     *        flushHead() 每拍仲裁后执行一次，因此同一拍最多只有一条指令出门。
+     *
+     * @param src       来源，枚举值即优先级（见 HeadSource）
+     * @param pitch     相机光轴下俯角（rad），语义与 moveHead 一致
+     * @param yaw       头部偏航角（rad，正=左），语义与 moveHead 一致
+     * @param minHoldMs 本来源成为持有者后，同级/更低优先级不得抢占的最短驻留时间。
+     *                  离散扫描点必须传「一个点位的驻留时长」（板端插值需 0.5 s 收敛，
+     *                  小于它等于让头部每次都到不了位）；连续跟踪传 0。
+     * @return int , 0 indicates success
+     */
+    int requestHead(HeadSource src, double pitch, double yaw, double minHoldMs = 0.0);
+
+    /**
+     * @brief 头部单一出口收口（每拍一次）：在行为树 tick 之后由 Brain::tick 调用。
+     *        先按优先级/驻留期选出本拍来源，再限幅、去重后下发。
+     */
+    void flushHead();
 
     /**
      * @brief 速度指令（x/y/theta 已在内部限幅并做最小速度补偿）
@@ -101,6 +141,17 @@ public:
     void checkStuck();
 
 private:
+    /** 头部请求槽位：每拍由 requestHead 写入，flushHead 读取仲裁。 */
+    struct HeadRequest
+    {
+        bool valid = false;
+        double pitch = 0.0;
+        double yaw = 0.0;
+        rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+        double minHoldMs = 0.0;
+    };
+    static constexpr int kHeadSourceCount = 6;  // = HeadSource 枚举取值个数（0..5）
+
     Brain* brain;
     std::unique_ptr<robot_io::ZlIo> zl;
     // zl 侧适配（2026-11-03 由独立节点并入）：真实球门位姿合成、球类型转换
@@ -114,4 +165,14 @@ private:
     double _lastLoggedVx = 0.0, _lastLoggedVy = 0.0, _lastLoggedVtheta = 0.0;
     rclcpp::Time _lastCmdLogTime;
     bool _hasLoggedCmd = false;
+
+    // ---- 头部单一出口仲裁状态（见 requestHead / flushHead）----
+    HeadRequest _headReq[kHeadSourceCount];
+    int _headOwner = 0;                              // 当前持有者，0 = 无
+    rclcpp::Time _headOwnerSince{0, 0, RCL_ROS_TIME}; // 持有者上任时刻（驻留期起算）
+    double _headOwnerMinHoldMs = 0.0;                // 持有者声明的驻留时长
+    double _headPubPitch = 0.0, _headPubYaw = 0.0;   // 上一条已下发指令（去重用）
+    bool _headPubValid = false;
+    double _headStaleMs = 200.0;   // 请求过期时长（参数 robot.head_arb_stale_ms）
+    double _headDedupRad = 0.01;   // 去重死区（参数 robot.head_arb_dedup_rad）
 };

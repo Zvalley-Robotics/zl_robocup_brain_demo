@@ -188,12 +188,6 @@ public:
     NodeStatus tick() override;
 
 private:
-    double _cmdSequence[6][2];    
-    rclcpp::Time _timeLastCmd;   
-    int _cmdIndex;                
-    long _cmdIntervalMSec;        
-    long _cmdRestartIntervalMSec; 
-
     Brain *brain;
 
 };
@@ -231,9 +225,8 @@ public:
     static PortsList providedPorts()
     {
         return {
-            // 2026-10-30: 300 → 550 ms。本体头部平滑节点每条指令约需 0.5 s 收敛，
-            // 原来每 300 ms 切一个目标，头部未到位就被下一格覆盖，实际覆盖率只有 50~60%。
-            InputPort<double>("msecs_interval", 550, "How many milliseconds to stay at the same position"),
+            // 2026-11-17: 端口已移除——点位/节拍统一到 Brain::findSweepTarget() 与
+            // robot.head_sweep_interval_ms。XML 均为 <CamFastScan />，不传端口，删之不碍加载。
         };
     }
 

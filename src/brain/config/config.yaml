@@ -74,11 +74,19 @@ brain_node:
       cmd_log_interval_ms: 1000 # setVelocity 日志节流间隔(ms)：>0 节流，0 逐拍全量输出（专项排查），<0 关闭
       # 头部限位（rad）。pitch 是「相机光轴下俯角」，由 zl_io.head_pitch_offset_deg=-36
       # 换算成 head_pitch 关节角。新头部相机相对 head_pitch_link 固定下俯 36°、pitch 关节
-      # 限位 ±25°，因此光轴只能落在 11°~61° 下俯（0.20~1.06 rad），不存在平视状 态。
+      # 限位 ±25°，因此光轴只能落在 11°~61° 下俯（0.20~1.06 rad），不存在平视状态。
       head_yaw_limit_left: 1.1
       head_yaw_limit_right: -1.1
       head_pitch_limit_up: 0.20 # 最抬头（下俯约 11.5°），再小会被机械限位夹住
       head_pitch_limit_down: 1.06 # 最低头（下俯约 60.7°）
+      # 头部单一出口仲裁（2026-11-17，RobotClient::requestHead）：丢球时 CamFindBall(700ms)
+      # 与 CamFastScan(550ms) 同拍各发一套 6 点目标，按「优先级 + 驻留期」只放行一个：
+      # MoveHead > RLVisionKick > CamTrackBall > 扫场(FindBall) > CamScanField。
+      head_arb_stale_ms: 200.0   # 节点不再 tick 后多久算「不再请求」（约 20 拍）
+      head_arb_dedup_rad: 0.01   # 与上一条已下发目标的死区，小于它不重发
+      # 丢球扫场每点驻留（ms）：CamFindBall 与 CamFastScan 共用同一份点位/相位。
+      # 板端插值固定 0.5 s，低于 500 头部永远到不了位（内部夹到 ≥500）。
+      head_sweep_interval_ms: 550.0
     
     # 2026-11-05 定位振荡取证（默认关闭）。
     # >0 时按该频率打印 dbg/track：pose(场地图) / ballR(机器体系) / ballF(场地图) / range yaw det age / kickDir / decision。
