@@ -1,0 +1,16 @@
+# 用途：统一 brain 包的行宽与缩进约束。
+# 注意：本文件**不用于**对既有文件整体执行 clang-format -i——那会把数千行无关注释/空行重排。
+# 只在改动或新增代码块时按此约束（尤其 ColumnLimit=100，注释同样受约束）。
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++17
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Empty
+
+# 注释排版：不自动重排中文注释（clang-format 对 CJK 宽度会误判），保留手工换行。
+ReflowComments: false
