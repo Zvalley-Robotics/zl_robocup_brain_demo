@@ -64,15 +64,34 @@
                              而交棒球距一直停在 0.50~0.55（Adjust 的收口点就是 range）。收到 0.38 后交棒球距预期
                              落在 0.36~0.42，接近模型最佳值；需与 DistMin=0.28（config_local）和 kick_range_min=0.33 同批。
                              风险：0.32~0.37 交棒曾出现 adapter 侧可见拍仅 3%~26%（2026-10-31，旧配置），
-                             （2026-11-09 晚）backoff_margin=0.12 / backoff_speed=0.30：range=0.38 已接近机身半径
+                             （2026-11-09 晚）backoff_margin=0.12 / backoff_speed：range=0.38 已接近机身半径
                              （腿尖距球 ~3 cm），切向绕行一圈必然把球蹭走 → 球被挪到脚边、视觉踢更难满足、
                              绕满 3 s 兜底放行行走踢（实测 adjust 兜底 3→6 次、行走踢 3→7 次）。
                              现未对准时先在 range+0.12 处绕行（腿扫不到），且径向项允许负值后退到目标半径；
                              一旦对准（|deltaDir|≤0.20）目标半径回到 range=0.38，交棒球距不变。
+                             backoff_speed 0.30 → 0.20（2026-11-13）：实测 −0.30 的后退是剩余负向 vx 的主体，
+                             双足后退重心不稳、观感“往后走时摇摇晃晃”；降到 0.20 后退更缓。
+                             再 0.20 → 0.15（同日第二轮）：b39g 盘 345 s 里 46 条负向 vx 全部 ≤0.20，
+                             其中 9 条正好压在 0.20（就是本项）；再降 25% 到 0.15，仍高于本体 0.1 m/s 死区。
+                             注意不能降太多：它同时是“球蹭到大近时退出去”的能力，太小可能退不出来。
+                             全局还有一道 robot.vx_limit_backward=0.25 兜底（其他节点的退避）。
                              backoff_speed=0 可完全退回旧行为（只能靠近、不能后退）。 -->
-                        <Adjust _while="decision =='adjust'" turn_threshold="0.5" range="0.38" vx_limit="0.7" vy_limit="0.6" vtheta_limit="1.0" vtheta_factor="1.0" tangential_speed_far="0.7" tangential_speed_near="0.25" backoff_margin="0.12" backoff_speed="0.30" />
-                        <Kick _while="decision == 'kick'" speed_limit="0.8" min_msec_kick="1000" msecs_stablize="1000"/>
-                        <Kick _while="decision == 'cross'" speed_limit="0.4" min_msec_kick="300"/>
+                        <!-- turn_first_threshold 0.5 → 0.9（2026-11-14 P1）：它是“球偏到多大角度就
+                             只转身不平移”的阀值（默认 0.5 rad≈28°）。实测 39 号机起脚前出现
+                             ballYaw=0.96 时 vx=vy≈0 而 vθ=0.89 的停摆段，一次白掉 1~2 s，
+                             adjustMs 从 3078 推到 3725、最大 5888。抬到 0.9 rad(51°) 后只在
+                             球真正在侧前方时才驻停；同时 brain_tree.cpp 的该分支已改成只在
+                             |deltaDir|>45°（还没对准）时生效，避免已对准时白等。 -->
+                        <!-- tangential_speed_near 0.25 → 0.08（2026-11-14 P0）：它是新弧长公式的
+                             下限。实测 δ=0.1 时弧长只有 0.03，却被 0.25 的下限顶成 0.25 m/s，
+                             在 R≈0.42 处合 0.6 rad/s，而准入门限才 0.22 rad → 一次 0.2~0.3 s
+                             执行滞后就冲过零点再反向冲回来（δ 56 s 内换向 41 次），
+                             下发 vy 在 −0.40/−0.06/+0.28/−0.24 之间每 0.5~1 s 翻一次。
+                             降到 0.08 后小偏差段角速度约 0.2 rad/s，过冲远小于门限。
+                             另外 brain_tree.cpp 已给 |δ|<0.08 加死区（st=0）与 sr ±5 cm 死区。 -->
+                        <Adjust _while="decision =='adjust'" turn_threshold="0.5" turn_first_threshold="0.9" range="0.38" vx_limit="1.0" vy_limit="0.8" vtheta_limit="1.6" vtheta_factor="1.0" tangential_speed_far="1.1" tangential_speed_near="0.12" backoff_margin="0.12" backoff_speed="0.25" />
+                        <Kick _while="decision == 'kick'" speed_limit="1.6" min_msec_kick="1000" msecs_stablize="1000"/>
+                        <Kick _while="decision == 'cross'" speed_limit="0.8" min_msec_kick="300"/>
                   </Sequence>
                </ReactiveSequence>
             </ReactiveSequence>

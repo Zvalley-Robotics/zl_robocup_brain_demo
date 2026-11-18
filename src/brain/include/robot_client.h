@@ -35,9 +35,17 @@ public:
 
     /**
      * @brief 速度指令（x/y/theta 已在内部限幅并做最小速度补偿）
+     * @param vyLimitOverride >0 时用该值替代 config 的 robot.vy_limit 做 y 轴限幅，
+     *        仍会被内部硬上限（kCmdVyHardMax）夹住；<=0 等于不生效。
+     *        目前只有守门员站位用（射门横移需要越过全局 0.4 的横移上限，
+     *        而不把全局上限抬高以免影响前锋/Assist）。
+     * @param accelVyOverride >0 时用该值替代 robot.accel_limit_vy 做 y 轴斜率限幅。
+     *        门将被射门时需要从 0 加速到 0.6（全局 1.2 m/s² 要 0.5 s，吃掉一半扑救时间），
+     *        故给门将单独放宽到本体自身平滑值；<=0 等于不生效。
      * @return int , 0 indicates success
      */
-    int setVelocity(double x, double y, double theta);
+    int setVelocity(double x, double y, double theta, double vyLimitOverride = -1.0,
+                    double accelVyOverride = -1.0);
 
     int crabWalk(double angle, double speed);
 
@@ -89,13 +97,17 @@ public:
 
     bool isStandingStill(double timeBuffer = 1000);
 
+    /** 指令-位移一致性观测：下发在跑但机体不动（接触/被顶住/打滑）时 1 Hz 告警，只报警不改速度。 */
+    void checkStuck();
+
 private:
     Brain* brain;
     std::unique_ptr<robot_io::ZlIo> zl;
     // zl 侧适配（2026-11-03 由独立节点并入）：真实球门位姿合成、球类型转换
     std::unique_ptr<robot_io::KickTargets> kick_targets;
     std::unique_ptr<robot_io::BallFwd> ball_fwd;
-    double _vx, _vy, _vtheta;
+    // 加速度限制需要读“上一拍下发值”，必须确定初值（原先未初始化）
+    double _vx = 0.0, _vy = 0.0, _vtheta = 0.0;
     rclcpp::Time _lastCmdTime;
     rclcpp::Time _lastNonZeroCmdTime;
     // setVelocity 日志节流状态：上次输出的指令、时间与是否已输出过

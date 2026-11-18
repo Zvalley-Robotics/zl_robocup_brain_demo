@@ -578,7 +578,9 @@ NodeStatus Chase::tick()
         log("avoid obstacle");
         // 只允许在相机 FOV 内偏转：FOV 外栅格恒返回“安全”(1e9)，直接采用
         // calcAvoidDir 会得到指向盲区的绕行角；限幅后仍受阻则减速直行。
-        const double speed = 0.5;
+        // 绕行速度已参数化（obstacle_avoidance.avoid_speed）：原为硬编码 0.5，
+        // 它不随 vx_limit/XML 限速变化，提速时须单独调这一项。
+        const double speed = brain->config->get_avoid_speed();
         const double maxOffset = deg2rad(brain->config->get_avoid_max_offset_deg());
         double avoidDir = 0;
         const bool dirOk = brain->calcSafeAvoidDir(targetDir, oaSafeDist, maxOffset, avoidDir);
@@ -608,7 +610,15 @@ NodeStatus Chase::tick()
                 targetDir, distToObstacle, oaSafeDist, avoidDir, dirOk ? 1 : 0, quantized ? 1 : 0, vx, vy));
         }
     } else {
-        vx = min(vxLimit, brain->data->ball.range);
+        // 接球段速度：用刹车模型按“到目标点的剩余距离”限速。旧写法 min(vxLimit, ball.range)
+        // 相当于 1 m/s per meter，在 2 m/s 档位最后 1 m 只有 1.0 的上限、制动距离不够，
+        // 实测会冲过球/冲过头。圆弧绕后另受“可跟踪角速度”约束，否则 ω=v/r 超限绕不回来。
+        const double toTarget = max(0.0, ballRange - dist);
+        double approachCap = brain->brakeSpeed(toTarget);
+        if (targetType == "circle_back") {
+            approachCap = min(approachCap, brain->config->get_vtheta_limit() * max(0.3, safeDist));
+        }
+        vx = min(vxLimit, approachCap);
         vy = 0;
         vtheta = targetDir;
         if (fabs(targetDir) < 0.1 && ballRange > 2.0) vtheta = 0.0;
@@ -994,7 +1004,7 @@ NodeStatus Assist::tick() {
     if (avoidObstacle && distToObstacle < oaSafeDist) {
         log("avoid obstacle");
         // 同 Chase：绕行角夹在相机 FOV 内，否则会被栅格外的 1e9 “安全”值引入盲区
-        const double speed = 0.5;
+        const double speed = brain->config->get_avoid_speed();
         const double maxOffset = deg2rad(brain->config->get_avoid_max_offset_deg());
         double avoidDir = 0;
         const bool dirOk = brain->calcSafeAvoidDir(targetDir, oaSafeDist, maxOffset, avoidDir);
@@ -1033,7 +1043,20 @@ NodeStatus Assist::tick() {
     vx = cap(vx, vxLimit, -vxLimit);     
     vy = cap(vy, vyLimit, -vyLimit);     
     
-
+    // 速度包络（2026-11-17）：Assist 是矢量平移（vx/vy 同时非零），按合速度等比例收缩，
+    // 方向不变；行进方向用本拍实际指令方向，而不是 targetDir。
+    {
+        const double mag = norm(vx, vy);
+        double capMag = brain->speedEnvelopeCap(atan2(vy, vx), "assist");
+        // 到位缓冲：按到站位点的剩余距离再夹一道刹车上限（否则 1.0 m/s 会冲过站位点）
+        capMag = min(capMag, brain->brakeSpeed(norm(targetPose_r.x, targetPose_r.y)));
+        if (mag > capMag && mag > 1e-6) {
+            const double s = capMag / mag;
+            vx *= s;
+            vy *= s;
+        }
+    }
+    
     brain->client->setVelocity(vx, vy, vtheta);
     return NodeStatus::SUCCESS;
 }
@@ -1077,26 +1100,53 @@ NodeStatus Adjust::tick()
     double st = st_far; 
     double R = ballRange; 
     double r = range;
-    // 绕球防蹭（2026-11-09）：range=0.38 时机器人的腿/机身半径已接近绕行半径（腿尖距球仅
-    // ~3 cm），切向绕行一圈必然把球蹭出去——球被挪到脚边后视觉踢条件更难满足，最终绕满
-    // kick_force_msec 兜底放行行走踢（实测 adjust 兜底 3→6 次、行走踢 3→7 次）。
-    // 处理分两段：
-    //   ① 未对准（|deltaDir| 大于对准锥）时，把目标半径抬到 range + backoff_margin，
-    //      让机器人在球外绕行，腿扫不到；
-    //   ② 径向项 sr 允许负值（最大 -backoff_speed），球距小于目标时主动后退；原先
-    //      cap(…, 0.5, 0) 只能靠近不能后退，一旦被蹭到贴脸就再也退不出去。
-    // 一旦对准（|deltaDir| ≤ 对准锥）目标半径回到 range，机器人前压到起脚距离，
-    // 所以交棒球距仍由 range 决定（当前 0.38，贴合模型最佳 0.35）。
-    constexpr double ALIGN_CONE = 0.20;   // ≈11.5°，与 StrikerDecide 的 dirAlign 0.22 同量级
-    const double rTarget = (fabs(deltaDir) > ALIGN_CONE) ? (r + backoffMargin) : r;
-    double sr = cap(R - rTarget, 0.5, -backoffSpeed); 
-    log(format("R: %.2f, r: %.2f, rT: %.2f, sr: %.2f", R, r, rTarget, sr));
+    // 球位单拍会跳（实测 0.35→0.60 m/0.3 s，远超本体能力），R 与 δ 取 3 拍中值：
+    // 对真实运动无感，但能剔掉单拍离群，切断「球位跳变 → sr/st 跳变」的链路。
+    {
+        static double R1 = -1.0, R2 = -1.0, D1 = 1e9, D2 = 1e9;
+        auto med3 = [](double a, double b, double c) {
+            return std::max(std::min(a, b), std::min(std::max(a, b), c));
+        };
+        if (R1 < 0.0) { R1 = R2 = R; D1 = D2 = deltaDir; }
+        const double Rf = med3(R, R1, R2);
+        const double Df = med3(deltaDir, D1, D2);
+        R2 = R1; R1 = R;
+        D2 = D1; D1 = deltaDir;
+        R = Rf;
+        deltaDir = Df;
+    }
+    // 绕球防蹭：未对准时目标半径抬到 range + backoff_margin，让机器人绕在球外一圈
+    // （range=0.38 时腿尖距球仅约 3 cm，沿内圈切向绕行会把球蹭走）；对准后前压到起脚距离。
+    // 取值与实测依据：docs/03_design/adjust_align_tuning.md#adjust-align
+    constexpr double ALIGN_CONE = 0.24;   // ≈13.7°，须 > StrikerDecide 的 kick_dir_align(0.22)
+    // 半径随 |δ| 连续抬升（替掉硬切换）再一阶低通：δ 穿门限时半径阶跃会把 sr 打反，
+    // 表现为“球没动、机器人在球前后来回走”。
+    constexpr double RTARGET_TAU = 0.10;  // s，仅作噪声滤器；过大会把半径平均在 0.44 卡住前压
+    const double alignFrac = cap(fabs(deltaDir) / ALIGN_CONE, 1.0, 0.0);
+    const double rTargetRaw = r + backoffMargin * alignFrac;
+    static double rTargetSmoothed = -1.0;
+    static rclcpp::Time lastRTargetTick{0, 0, RCL_ROS_TIME};
+    const auto rTargetNow = brain->get_clock()->now();
+    const double rTargetDt = (lastRTargetTick.nanoseconds() > 0)
+                                 ? (rTargetNow - lastRTargetTick).seconds() : 0.0;
+    lastRTargetTick = rTargetNow;
+    if (rTargetSmoothed < 0.0 || rTargetDt < 1e-3 || rTargetDt > 0.5) {
+        rTargetSmoothed = rTargetRaw; // 首拍 / 断流 / 长间隔：直接对齐，不做平滑
+    } else {
+        const double alpha = 1.0 - std::exp(-rTargetDt / RTARGET_TAU);
+        rTargetSmoothed += alpha * (rTargetRaw - rTargetSmoothed);
+    }
+    double srCap = max(0.5, min(1.2, brain->brakeSpeed(max(0.0, R - rTargetSmoothed))));
+    double sr = cap(R - rTargetSmoothed, srCap, -backoffSpeed); 
+    // 径向死区 5 cm：球位跳变 0.25 m 会直接变成一次满幅后退，观感是“在球前后蹭”。
+    // 进入对准锥后保证 0.12 m/s 前压：连续化半径在此处只剩 0.02 m/s，要爬 5 s 才吃掉 10 cm
+    // （贴线球分支优先级更高，会把 sr 重新压到 0）。
+    if (fabs(R - rTargetSmoothed) < 0.05) sr = 0.0;
+    if (fabs(deltaDir) < ALIGN_CONE) sr = max(sr, 0.12);
+    log(format("R: %.2f, r: %.2f, rT: %.2f/%.2f, sr: %.2f", R, r, rTargetRaw, rTargetSmoothed, sr));
 
-    // 贴线球保护：球贴底线/边线时，若沿“机器人→球”方向继续径向收紧，等于顶着
-    // 球往线外推（角球等放行时还没对齐的场景，会把摆好的贴线球直接蹭出界）。
-    // 判定：沿该方向推球在 1.5 m 内会出线 -> 取消径向靠近、只保留切向绕行，
-    // 绕到 kickDir 对齐（reachedKickDir）后由决策层直接起脚，球自然走向场内；
-    // 距离远时先缓收到绕行半径，避免绕行圈太大扫出场外。
+    // 贴线球保护：沿“机器人→球”推球 1.5 m 内会出线时取消径向靠近，只保留切向绕行，
+    // 绕到 kickDir 对齐后交给决策层起脚，避免把摆好的贴线球顶出界。
     {
         auto fd = brain->config->fieldDimensions;
         auto bPos = brain->data->ball.posToField;
@@ -1113,9 +1163,21 @@ NodeStatus Adjust::tick()
     }
 
     log(format("deltaDir = %.1f", deltaDir));
-    if (fabs(deltaDir) * R < NEAR_THRESHOLD) {
-        log("use near speed");
-        st = st_near;
+    // 切向速度按「弧长 / 期望绕行时间」给：大偏差自然快，小偏差降到 st_near，
+    // 不再只看球距（旧法对上 140° 起手要 4.7 s，吃穿 kick_force_msec）。
+    // near_threshold 已不参与计算，保留声明仅为 XML 兼容。
+    {
+        constexpr double ST_ARC_TIME = 1.2;    // s，绕完当前弧长的期望时间
+        // 近球上限 0.45：0.50 侧向过多且会蹭球，0.30 太慢（140° 起手要 4.7 s）。
+        constexpr double ST_MAX_NEAR = 0.45;   // m/s
+        const double arcLen = fabs(deltaDir) * R;
+        const double nearFar01 = cap((R - 0.60) / 0.60, 1.0, 0.0);
+        const double stCap = ST_MAX_NEAR + (st_far - ST_MAX_NEAR) * nearFar01;
+        st = cap(arcLen / ST_ARC_TIME, stCap, st_near);
+        // 切向死区：δ 穿零时方向翻转，配合下限会形成 ±0.3 rad 极限环；进死区就停止绕行，
+        // 交给径向项把 R 压到 0.38（XML 的 tangential_speed_near 已同步降到 0.08）。
+        if (fabs(deltaDir) < 0.08) st = 0.0;
+        log(format("st: %.2f (arcLen=%.2f R=%.2f cap=%.2f)", st, arcLen, R, stCap));
     }
 
     double theta_robot_f = brain->data->robotPoseToField.theta; 
@@ -1141,24 +1203,41 @@ NodeStatus Adjust::tick()
             vtheta = yawControl(brain, bodyErrAdjust, stAdjustKickDir, vthetaLimit, vtheta_factor, 0.0);
         }
     } 
+    // 「先转身再平移」只在球明显在侧方且 δ 未对准时驻停：机身转向不改变「机器人→球」
+    // 方位，δ 只能靠平移收敛；已对准时冻结平移只是干等（实测白掉 1~2 s）。
     if (
         fabs(ballYaw) > TURN_FIRST_THRESHOLD 
-        && fabs(deltaDir) < M_PI / 4
+        && fabs(deltaDir) > M_PI / 4
     ) { 
         vx = 0;
         vy = 0;
+    }
+
+    // 缓冲（2026-11-17）：按“径向剩余 + 剩余弧长”的总路径限速，防止 1 m/s 档位冲过
+    // 0.38 m 的收口点后又要倒车（旧行为只在径向用固定 0.5 上限，提速后不够用）。
+    {
+        const double pathLen = max(0.0, R - rTargetSmoothed) + fabs(deltaDir) * max(0.0, R);
+        const double capMag = brain->brakeSpeed(pathLen);
+        const double mag = norm(vx, vy);
+        if (mag > capMag && mag > 1e-6) {
+            const double s = capMag / mag;
+            vx *= s;
+            vy *= s;
+        }
     }
 
     vx = cap(vx, vxLimit, -backoffSpeed);   // 下限放开：允许负向径向后退（防蹭不可少）
     vy = cap(vy, vyLimit, -vyLimit);
     vtheta = cap(vtheta, vthetaLimit, -vthetaLimit);
 
-    // 队友贴身单侧让位（同 Chase）：两台同时绕同一个球摆位时只让较差的一台退开。
-    // 阈值 0.55 而不是 0.8：绕球对准本就要贴到球后 0.4~0.6 m，太早退会让两台都
-    // 对不准 kickDir（卡在 adjust）；球已在 0.55 m 内时不再干预，保证有人能起脚。
+    // 队友贴身单侧让位（同 Chase）：只让较差的一台侧向切出。提前量 0.9 m（小于 Chase 的
+    // 1.2）：绕球本就要贴到球后 0.4~0.6 m，太早退会让两台都对不准 kickDir。
     {
         double yieldVx, yieldVy, yieldVtheta;
-        if (brain->calcChaseYieldVelocity(yieldVx, yieldVy, yieldVtheta, 0.55)) {
+        // heading 用本拍绕球速度方向（机体系 vx/vy + 机身朝角）换算到场系：
+        // 绕球是切向运动，只有队友挡在切向弧线上才让，避免“队友在球另一侧”的无谓让位
+        const double adjustHeading = brain->data->robotPoseToField.theta + atan2(vy, vx);
+        if (brain->calcChaseYieldVelocity(yieldVx, yieldVy, yieldVtheta, 0.8, 1.4, 1.0, adjustHeading)) {
             log(format("yield to teammate, vx: %.2f vy: %.2f", yieldVx, yieldVy));
             brain->client->setVelocity(yieldVx, yieldVy, yieldVtheta);
             return NodeStatus::SUCCESS;

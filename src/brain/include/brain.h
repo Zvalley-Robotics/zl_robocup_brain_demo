@@ -218,6 +218,39 @@ public:
      */
     double distToObstacle(double angle);
 
+    /**
+     * @brief 距离-速度刹车模型：在剩余距离 d 内能刹停的速度上限（含感知/执行滞后）。
+     *
+     *   v = −a·τ + √((a·τ)² + 2a·d)
+     * 推导：制动距离 v²/(2a) 加上滞后期间走过的 v·τ 不超过 d。
+     * a 默认取 robot.brake_decel，τ 默认取 robot.brake_latency；显式传入可用于包络的
+     * 独立参数（obstacle_avoidance.speed_envelope_decel/latency）。
+     *
+     * @param distance 到目标的净距离（m，<=0 返回 0）
+     * @param decel 减速度（m/s²，<=0 时取 robot.brake_decel；两者都<=0 则不约束，返回 1e9）
+     * @param latency 总滞后（s，<0 时取 robot.brake_latency）
+     * @return double 允许速度上限（m/s），调用方自行与节点限速取 min
+     */
+    double brakeSpeed(double distance, double decel = -1.0, double latency = -1.0);
+
+    /**
+     * @brief 速度包络：按“最紧清距”给出本拍允许的平面速度上限（只降不升）。
+     *
+     * v_allow = gain × (clearance − margin)，再夹到 [floor, ceiling]；clearance 取三者最小：
+     *   1) 沿 headingRad（机体系）的障碍走廊清距（distToObstacle，栅格外恒 1e9 不约束）；
+     *   2) 最近存活队友的直线距离；
+     *   3) 沿行进方向（场系，由 robotPoseToField.theta + headingRad 换算）到场地边线的距离。
+     *
+     * 用途：“只在空档大时才快”：远处空档可到 ceiling，接近障碍/队友/边线自动落回 floor。
+     * 必须与调用方自身速度取 min 使用；参数来自 obstacle_avoidance.speed_envelope_*，
+     * enable=false 或 ceiling<=0 时直接返回 robot.vx_limit（等价关闭）。
+     *
+     * @param headingRad 行进方向（机体系，rad）
+     * @param tag 日志标签（"chase"/"assist"），仅用于 1 Hz 观测
+     * @return double 允许的速度上限（m/s）
+     */
+    double speedEnvelopeCap(double headingRad, const char *tag = nullptr);
+
     vector<double> findSafeDirections(double startAngle, double safeDist, double step=deg2rad(10));
 
     double calcAvoidDir(double startAngle, double safeDist);

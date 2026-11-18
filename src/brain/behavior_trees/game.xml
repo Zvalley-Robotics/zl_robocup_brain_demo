@@ -12,9 +12,9 @@
         <Sequence name="root">
             <RunOnce><Script code="control_state=3" /></RunOnce>
             <ReactiveSequence _while="control_state==1 || assist_kick || go_manual || assist_chase" name="controller direct control (cs==1)" >
-                <SimpleChase _while="assist_chase" vx_limit="1.5" vy_limit="0.1" stop_dist="0.0" stop_angle="0.3" />
+                <SimpleChase _while="assist_chase" vx_limit="2.2" vy_limit="0.2" stop_dist="0.0" stop_angle="0.3" />
                 <Sequence _while="assist_kick" name="assist kick">
-                    <Kick speed_limit="0.9" min_msec_kick="1000"/>
+                    <Kick speed_limit="1.6" min_msec_kick="1000"/>
                </Sequence>
             </ReactiveSequence>
 
@@ -52,7 +52,7 @@
                             <!-- READY 要看清远端场地线才能定位：新头零位即下俯 36°，0.22 rad 是光轴
                                  接近最抬头（约 13° 下俯，硬件可达 11°~61°），不要填 0（会撞机械限位）。 -->
                             <MoveHead pitch="0.22" yaw="0.0" />
-                            <GoToReadyPosition  vx_limit="0.7" />
+                            <GoToReadyPosition  vx_limit="1.4" />
                             <SubTree ID="Locate" _autoremap="true" />
                         </ReactiveSequence>
 

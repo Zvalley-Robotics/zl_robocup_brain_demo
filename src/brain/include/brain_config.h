@@ -47,7 +47,15 @@ public:
     double get_yaw_offset();
     double get_vx_limit();
     double get_vy_limit();
+    double get_vx_limit_backward();// 后退（vx<0）单独上限；<=0 或 >= vx_limit 时等于关闭
     double get_vtheta_limit();
+    // 减速（刹车）斜率：|指令| 变小或换向时生效；<=0 时回退到对应的加速度值。
+    double get_decel_limit_vx();
+    double get_decel_limit_vy();
+    double get_decel_limit_vtheta();
+    // 距离-速度刹车模型参数（Brain::brakeSpeed）
+    double get_brake_decel();
+    double get_brake_latency();
     double get_head_yaw_limit_left();
     double get_head_yaw_limit_right();
     double get_head_pitch_limit_up();
@@ -55,11 +63,15 @@ public:
     double get_min_vx();
     double get_min_vy();
     double get_min_vtheta();
+    double get_min_lin_speed();     // 线速度合模抬升门限（本体对 <0.1 m/s 不响应）
     double get_speed_scale();       // 下发值→本体的统一缩放（1.0=新真实速度，0.5=回退旧手感）
     double get_yaw_track_gain();    // 球方位→角速度的跟踪增益（原硬编码 *4.0）
     double get_yaw_track_deadband();// 球方位跟踪死区（rad），内直接归零
     double get_yaw_track_damping(); // 转向阻尼增益（D 项）；<=0 时退化为纯 P
     double get_yaw_rate_lpf_hz();   // 实测角速度（odom yaw 差分）低通截止频率
+    double get_accel_limit_vx();    // 下发前 vx 斜率限幅（m/s²），<=0 关闭
+    double get_accel_limit_vy();    // 下发前 vy 斜率限幅（m/s²），<=0 关闭
+    double get_accel_limit_vtheta();// 下发前 vtheta 斜率限幅（rad/s²），<=0 关闭
     double get_track_log_hz();     // dbg/track 打印频率（Hz），<=0 关闭
     int get_cmd_log_interval_ms(); // setVelocity 日志节流间隔(ms)，<=0 关闭
 
@@ -116,6 +128,18 @@ public:
     // 原因：走廊模型下小偏转会把障碍推出 collision_threshold，distToObstacle 返回 1e9，
     // 回查会把近距障碍误判为“已绕开”。
     double get_avoid_min_clearance_m();
+    // 绕行分支基准线速度（m/s）：Chase/Assist 两处原为硬编码 0.5。
+    // 注意它不是限速阀——绕行时实际速度就是它（微偏转分支为 0.7×），与 vx_limit 无关。
+    double get_avoid_speed();
+    // ---- 速度包络（2026-11-17）：按“最紧清距”给出本拍允许的速度上限，只降不升 ----
+    bool get_speed_envelope_enable();
+    double get_speed_envelope_decel();      // m/s²：刹车模型的本体可达减速度
+    double get_speed_envelope_latency();    // s：感知+决策+执行总滞后
+    double get_speed_envelope_floor();      // m/s：下限，避免贴身清距把速度压成爬行
+    double get_speed_envelope_ceiling();    // m/s：上限，<=0 时取 robot.vx_limit
+    double get_speed_envelope_margin();     // m：障碍清距里扣掉的余量
+    double get_speed_envelope_tm_margin();  // m：队友清距里扣掉的余量
+    double get_speed_envelope_field_margin(); // m：边线清距里扣掉的余量
     double get_collision_threshold();
     double get_safe_distance();
     double get_avoid_secs();

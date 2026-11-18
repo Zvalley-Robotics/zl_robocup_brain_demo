@@ -55,9 +55,17 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("robot.vx_limit", 1.0);
     declare_parameter<double>("robot.vy_limit", 0.4);
     declare_parameter<double>("robot.vtheta_limit", 1.0);
+    // 后退（vx<0）单独上限：vx_limit 正负对称，各节点都能要求 1.0 m/s 后退而双足后退不稳。
+    // setVelocity 出口统一夹住（覆盖 moveToPoseOnField* 的 -vxLimit 与 READY 的 -0.4）；
+    // <=0 或 >= vx_limit 时等于关闭。Adjust 另有 XML backoff_speed 更紧。
+    declare_parameter<double>("robot.vx_limit_backward", 0.25);
     declare_parameter<double>("robot.min_vx", 0.4);
     declare_parameter<double>("robot.min_vy", 0.3);
     declare_parameter<double>("robot.min_vtheta", 0.2);
+    // 本体对「合速度模 < 0.1 m/s」不响应（不是逐轴）。min_lin_speed 是合模抬升门限
+    // （0.12 = 死区 0.1 + 20% 余量）：按比例放大模长、保持方向，后退方向不抬升。
+    // min_vx/min_vy 仍保留，行为树侧用它们判断“某分量是否可表达”。
+    declare_parameter<double>("robot.min_lin_speed", 0.12);
     // 2026-11-05：3588 侧取消速度映射缩减后，本体 1:1 执行下发值（旧版实际约折半）。
     // speed_scale 是“下发值→本体”的统一缩放（1.0 = 新真实速度，0.5 = 回退旧手感）；
     // yaw_track_* 收口原本硬编码的 *4.0 球方位跟踪增益（SimpleChase / 门将 / Assist 三处）。
@@ -69,16 +77,33 @@ Brain::Brain() : rclcpp::Node("brain_node")
     // yaw_rate_lpf_hz 抑制步态振动带进来的角速度噪声。
     declare_parameter<double>("robot.yaw_track_damping", 0.20);
     declare_parameter<double>("robot.yaw_rate_lpf_hz", 8.0);
+    // 下发出口统一的斜率（加速度）限幅，替代各阶段各自打补丁：一拍内全额反向本质是阶跃
+    // 指令，限速后变斜坡。板端 rl_manager 已有 ≈2.5 m/s² 平滑，本层须更小才有增量意义。
+    // <=0 关闭，三轴可独立回退。
+    declare_parameter<double>("robot.accel_limit_vx", 2.0);
+    declare_parameter<double>("robot.accel_limit_vy", 1.2);
+    declare_parameter<double>("robot.accel_limit_vtheta", 8.0);
+    // 减速（刹车）斜率：|指令| 变小或换向时生效，<=0 回退到对应加速度值
+    declare_parameter<double>("robot.decel_limit_vx", 0.0);
+    declare_parameter<double>("robot.decel_limit_vy", 0.0);
+    declare_parameter<double>("robot.decel_limit_vtheta", 0.0);
+    // 距离-速度刹车模型：v = −a·τ + √((a·τ)² + 2a·d)
+    declare_parameter<double>("robot.brake_decel", 2.5);
+    declare_parameter<double>("robot.brake_latency", 0.20);
     // 定位振荡取证：>0 时按该频率打印 dbg/track（pose / 球机体系 / 球场地系 / 决策），0 关闭
     declare_parameter<double>("debug.track_log_hz", 0.0);
     // 头部关节限位（rad）。pitch 语义是「相机光轴下俯角」，由 bridge 的
-    // head_pitch_offset_deg=-36 换算成 head_pitch 关节角。新头部相机相对
-    // head_pitch_link 固定下俯 36°、pitch 关节限位 ±25°，因此光轴可达
-    // 11°~61° 下俯，即 brain 侧 0.20~1.06 rad（两端各留约 0.5° 机械余量），越界会被夹死。
+    // head_pitch_offset_deg=-36 换算成 head_pitch 关节角；新头部相机相对 head_pitch_link
+    // 固定下俯 36°、pitch 关节限位 ±25°，故光轴可达 11°~61° 下俯，越界会被夹死。
     declare_parameter<double>("robot.head_yaw_limit_left", 1.1);
     declare_parameter<double>("robot.head_yaw_limit_right", -1.1);
     declare_parameter<double>("robot.head_pitch_limit_up", 0.20);
     declare_parameter<double>("robot.head_pitch_limit_down", 1.06);
+    // 头部单一出口仲裁（2026-11-17，见 RobotClient::requestHead）：丢球时 CamFindBall(700ms)
+    // 与 CamFastScan(550ms) 同拍各发一套 6 点目标，头部在两套端点间反复反向（剧烈晃头）。
+    declare_parameter<double>("robot.head_arb_stale_ms", 200.0);   // 请求多久不刷新算“不再请求”
+    declare_parameter<double>("robot.head_arb_dedup_rad", 0.01);   // 与上一条目标相差小于此不重发
+    declare_parameter<double>("robot.head_sweep_interval_ms", 550.0);  // 扫场每点驻留（夹 ≥500）
 
     declare_parameter<double>("strategy.ball_confidence_threshold", 50.0);   
     declare_parameter<double>("strategy.ball_memory_timeout", 3.0);
@@ -141,6 +166,17 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("obstacle_avoidance.avoid_max_offset_deg", 30.0);
     // 贴身区（m）：障碍近于此距离时不再做小角度绕行（走廊模型会误判“已绕开”），改由调用方停车
     declare_parameter<double>("obstacle_avoidance.avoid_min_clearance_m", 0.8);
+    // 绕行分支基准线速度（Chase/Assist 共用；原为两处硬编码 0.5）
+    declare_parameter<double>("obstacle_avoidance.avoid_speed", 0.5);
+    // ---- 速度包络（2026-11-17）：按“最紧清距”限制行进速度，只降不升 ----
+    declare_parameter<bool>("obstacle_avoidance.speed_envelope_enable", true);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_decel", 2.5);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_latency", 0.20);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_floor", 0.7);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_ceiling", 2.2);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_margin", 0.35);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_tm_margin", 0.70);
+    declare_parameter<double>("obstacle_avoidance.speed_envelope_field_margin", 0.60);
     declare_parameter<bool>("obstacle_avoidance.avoid_during_kick", false);
     declare_parameter<double>("obstacle_avoidance.kick_ao_safe_dist", 1.0);
     // base 原点（torso_link）-> 地面的 +z 偏置，必须与 zl 侧 head_to_base 原点离地高度一致；
@@ -2516,6 +2552,77 @@ double Brain::distToObstacle(double angle) {
         }
     }
     return minDist;
+}
+
+double Brain::brakeSpeed(double distance, double decel, double latency) {
+    if (!std::isfinite(distance)) return 1e9;
+    if (distance <= 0.0) return 0.0;
+    const double a = decel > 0.0 ? decel : config->get_brake_decel();
+    const double tau = latency >= 0.0 ? latency : config->get_brake_latency();
+    if (a <= 0.0) return 1e9; // 未配置 = 不约束
+    const double at = a * max(0.0, tau);
+    return -at + sqrt(at * at + 2.0 * a * distance);
+}
+
+double Brain::speedEnvelopeCap(double headingRad, const char *tag) {
+    const double vMax = config->get_speed_envelope_ceiling() > 0.0
+                            ? config->get_speed_envelope_ceiling()
+                            : config->get_vx_limit();
+    if (!config->get_speed_envelope_enable() || vMax <= 0.0) return vMax;
+    const double a = config->get_speed_envelope_decel();
+    const double tau = config->get_speed_envelope_latency();
+    if (a <= 0.0) return vMax;
+
+    double capAll = vMax;
+
+    // 1) 障碍：沿该方向的走廊清距。栅格量程外/无障时恒为 1e9，等于不约束。
+    const double obsDist = distToObstacle(headingRad);
+    if (obsDist < 1e8) {
+        capAll = min(capAll, brakeSpeed(obsDist - config->get_speed_envelope_margin(), a, tau));
+    }
+
+    // 2) 队友：最近存活队友的直线距离（让位仲裁另有一套，这里只做减速不干预方向）
+    double tmDist = 1e9;
+    const int selfIdx = config->get_player_id() - 1;
+    for (int i = 0; i < HL_MAX_NUM_PLAYERS; i++) {
+        if (i == selfIdx || !data->tmStatus[i].isAlive) continue;
+        const double d = norm(data->robotPoseToField.x - data->tmStatus[i].robotPoseToField.x,
+                              data->robotPoseToField.y - data->tmStatus[i].robotPoseToField.y);
+        if (d < tmDist) tmDist = d;
+    }
+    if (tmDist < 1e8) {
+        capAll = min(capAll, brakeSpeed(tmDist - config->get_speed_envelope_tm_margin(), a, tau));
+    }
+
+    // 3) 场地边线：沿行进方向（场系）到最近边界的距离，已越界视为 0。
+    // 射线与矩形求交：x/y 两个方向各算一次，取先打到的那条。
+    const double fieldHeading = data->robotPoseToField.theta + headingRad;
+    const double dx = cos(fieldHeading), dy = sin(fieldHeading);
+    const double halfL = config->fieldDimensions.length / 2.0;
+    const double halfW = config->fieldDimensions.width / 2.0;
+    const double px = data->robotPoseToField.x, py = data->robotPoseToField.y;
+    double edgeDist = 1e9;
+    if (fabs(dx) > 1e-9) edgeDist = min(edgeDist, max(0.0, ((dx > 0 ? halfL : -halfL) - px) / dx));
+    if (fabs(dy) > 1e-9) edgeDist = min(edgeDist, max(0.0, ((dy > 0 ? halfW : -halfW) - py) / dy));
+    if (edgeDist < 1e8) {
+        capAll = min(capAll, brakeSpeed(edgeDist - config->get_speed_envelope_field_margin(), a, tau));
+    }
+
+    // 下限兜底（先夹到不超过上限，否则 cap() 的参数顺序会反转）
+    const double floorV = min(config->get_speed_envelope_floor(), vMax);
+    capAll = cap(capAll, vMax, floorV);
+
+    // 1 Hz 观测：实机上区分“是包络在限速”与“节点/加速度限制在限速”。
+    if (capAll < vMax - 1e-3) {
+        static rclcpp::Time lastEnvLog = get_clock()->now();
+        if (msecsSince(lastEnvLog) > 1000) {
+            lastEnvLog = get_clock()->now();
+            log->log(string("env/") + (tag ? tag : "all"),
+                     format("cap=%.2f obs=%.2f tm=%.2f edge=%.2f vmax=%.2f a=%.1f tau=%.2f",
+                            capAll, obsDist, tmDist, edgeDist, vMax, a, tau));
+        }
+    }
+    return capAll;
 }
 
 vector<double> Brain::findSafeDirections(double startAngle, double safeDist, double step) {

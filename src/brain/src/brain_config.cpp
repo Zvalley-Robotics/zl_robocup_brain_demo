@@ -85,8 +85,32 @@ double BrainConfig::get_vy_limit() {
     return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.vy_limit", 0.4);
 }
 
+double BrainConfig::get_vx_limit_backward() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.vx_limit_backward", 0.25);
+}
+
 double BrainConfig::get_vtheta_limit() {
     return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.vtheta_limit", 1.2);
+}
+
+double BrainConfig::get_decel_limit_vx() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.decel_limit_vx", 0.0);
+}
+
+double BrainConfig::get_decel_limit_vy() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.decel_limit_vy", 0.0);
+}
+
+double BrainConfig::get_decel_limit_vtheta() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.decel_limit_vtheta", 0.0);
+}
+
+double BrainConfig::get_brake_decel() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.brake_decel", 2.5);
+}
+
+double BrainConfig::get_brake_latency() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.brake_latency", 0.20);
 }
 
 double BrainConfig::get_head_yaw_limit_left() {
@@ -119,6 +143,10 @@ double BrainConfig::get_min_vtheta() {
     return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.min_vtheta", 0.2);
 }
 
+double BrainConfig::get_min_lin_speed() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.min_lin_speed", 0.12);
+}
+
 double BrainConfig::get_speed_scale() {
     return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.speed_scale", 1.0);
 }
@@ -137,6 +165,18 @@ double BrainConfig::get_yaw_track_damping() {
 
 double BrainConfig::get_yaw_rate_lpf_hz() {
     return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.yaw_rate_lpf_hz", 8.0);
+}
+
+double BrainConfig::get_accel_limit_vx() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.accel_limit_vx", 2.0);
+}
+
+double BrainConfig::get_accel_limit_vy() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.accel_limit_vy", 1.2);
+}
+
+double BrainConfig::get_accel_limit_vtheta() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("robot.accel_limit_vtheta", 8.0);
 }
 
 double BrainConfig::get_track_log_hz() {
@@ -315,6 +355,42 @@ double BrainConfig::get_avoid_max_offset_deg() {
 
 double BrainConfig::get_avoid_min_clearance_m() {
     return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.avoid_min_clearance_m", 0.8);
+}
+
+double BrainConfig::get_avoid_speed() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.avoid_speed", 0.5);
+}
+
+bool BrainConfig::get_speed_envelope_enable() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_enable", true);
+}
+
+double BrainConfig::get_speed_envelope_decel() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_decel", 2.5);
+}
+
+double BrainConfig::get_speed_envelope_latency() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_latency", 0.20);
+}
+
+double BrainConfig::get_speed_envelope_floor() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_floor", 0.6);
+}
+
+double BrainConfig::get_speed_envelope_ceiling() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_ceiling", 1.2);
+}
+
+double BrainConfig::get_speed_envelope_margin() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_margin", 1.0);
+}
+
+double BrainConfig::get_speed_envelope_tm_margin() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_tm_margin", 0.5);
+}
+
+double BrainConfig::get_speed_envelope_field_margin() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("obstacle_avoidance.speed_envelope_field_margin", 0.5);
 }
 
 double BrainConfig::get_collision_threshold() {
@@ -639,12 +715,15 @@ void BrainConfig::print(ostream &os)
     os << "    vxFactor = " << get_vx_factor() << endl;
     os << "    yawOffset = " << get_yaw_offset() << endl;
     os << "    vxLimit = " << get_vx_limit() << endl;
+    os << "    vxLimitBackward = " << get_vx_limit_backward() << endl;
     os << "    vyLimit = " << get_vy_limit() << endl;
     os << "    vthetaLimit = " << get_vtheta_limit() << endl;
     os << "    speedScale = " << get_speed_scale() << endl;
     os << "    minVx/minVy/minVtheta = " << get_min_vx() << "/" << get_min_vy() << "/" << get_min_vtheta() << endl;
+    os << "    minLinSpeed = " << get_min_lin_speed() << endl;
     os << "    yawTrackGain/deadband = " << get_yaw_track_gain() << "/" << get_yaw_track_deadband() << endl;
     os << "    yawTrackDamping/lpfHz = " << get_yaw_track_damping() << "/" << get_yaw_rate_lpf_hz() << endl;
+    os << "    accelLimit vx/vy/vtheta = " << get_accel_limit_vx() << "/" << get_accel_limit_vy() << "/" << get_accel_limit_vtheta() << endl;
     os << "----------------------------------------" << endl;
     os << "Strategy:" << endl;
     os << "    ballConfidenceThreshold = " << get_ball_confidence_threshold() << endl;

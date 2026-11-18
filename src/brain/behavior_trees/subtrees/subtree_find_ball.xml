@@ -13,7 +13,7 @@
             <CamFastScan />
         </ReactiveSequence>
         <ReactiveSequence>
-          <GoToReadyPosition  vx_limit="0.7" />
+          <GoToReadyPosition  vx_limit="1.4" />
           <Sleep msec="5000" />
         </ReactiveSequence>
       </Sequence>

@@ -14,31 +14,63 @@ brain_node:
       odom_factor: 0.8 # 1.2 for T1
       vx_factor: 0.50
       yaw_offset: 0.0
-      # 注意：vx_factor 只折 crabWalk 路径的 vx（x/y 位移比标定补偿），与 speed_scale 语义不同，勿混用。
-      vx_limit: 1.0
-      vy_limit: 0.4
-      vtheta_limit: 1.2
+      # 注意：vx_factor 只折 crabWalk 路径的 vx（x/y 位移比标定补偿），
+      # 与 speed_scale 语义不同，勿混用。
+      # 2026-11-17 整体提速 2×：行进上限 1.2 → 2.2 m/s（本体可跟踪到 2.7，按跟踪比 ~0.9
+      # 反推 2.2 指令≈2.0 实测）。真正能跑多快仍由 obstacle_avoidance.speed_envelope_* 按清距决定。
+      vx_limit: 2.2
+      vy_limit: 0.6
+      vtheta_limit: 1.6
+      # 后退（vx<0）单独上限：vx_limit 正负对称，2.2 意味着任何节点都能要求 2.2 m/s 后退，
+      # 而双足后退重心不稳，故只放到 0.35（提速不包含倒退）。<=0 或 >= vx_limit 等于关闭。
+      vx_limit_backward: 0.35
       # 2026-11-05：3588 侧取消速度映射缩减后，本体按下发值 1:1 执行（旧版本实际约折半）。
       # 1.0 = 保持新真实速度；需要快速回退到旧手感时设为 0.5（等价旧映射），重启 brain 即生效。
       # 只作用于 setVelocity 出口的“下发值→本体”一段，min_v* 与各 *limit 仍按本体侧单位解释。
       speed_scale: 1.0
-      # 下限抬升原值 0.3/0.3/0.25 是按折半速度标定的；提速后同样的抬升相当于每拍位移/角位移翻倍，
-      # 近零误差时会变成持续横移+原地转（实测出现过 448 s 恒定 (-0.30, +0.30, +0.25)），故随速度系数一并折半。
-      min_vx: 0.15 # Minimum x velocity when command is too small, to prevent no response
-      min_vy: 0.15 # Minimum y velocity when command is too small, to prevent no response
-      min_vtheta: 0.12 # Minimum theta velocity when command is too small, to prevent no response
+      # 下限抬升按合速度模而非逐轴：本体对「合模 < 0.1 m/s」不响应，min_lin_speed 是抬升
+      # 门限（0.12 = 死区 0.1 + 20% 余量），按比例放大、方向不变，后退方向不放大。
+      # min_vx/min_vy 仍保留，行为树侧用它们判断“某分量是否可表达”；值随速度系数一并折半。
+      min_lin_speed: 0.12
+      # min_vx/min_vy 现已不参与下发抬升，仅保留给行为树判“某分量是否可表达”（避障微偏转归零）。
+      min_vx: 0.15 # 行为树侧：vx 分量死区判据（不再用于 setVelocity 抬升）
+      min_vy: 0.15 # 行为树侧：vy 分量死区判据（不再用于 setVelocity 抬升）
+      min_vtheta: 0.12 # 角速度单位不同，仍单独抬升
       # 球方位→角速度的跟踪增益（SimpleChase / GoToGoalBlocking / Assist 原为硬编码 *4.0）。
-      # 2.0 ≈ 提速前的等效增益；|yaw| < deadband 直接归零，避免 min_vtheta 抬升把近零方位误差放大成持续原地转。
+      # 2.0 ≈ 提速前的等效增益；|yaw| < deadband 直接归零，
+      # 避免 min_vtheta 抬升把近零方位误差放大成持续原地转。
       yaw_track_gain: 2.0
       yaw_track_deadband: 0.08
-      # 2026-11-06：转向纯 P 在执行滞后（步态+板端平滑 100~200ms）叠加增益翻倍后形成极限环，
-      # 表现为球静止时机器人绕球来回摆（实测球位 157 帧不变、vx=vy=0 而 vtheta 反复换向）。
-      # damping 是 D 项增益，作用于 odom 实测角速度（非误差差分，目标跳变不会产生微分尖峰）：
-      #   vtheta = Kp*err - damping*omega，omega 涨到 Kp*err/damping 时输出归零，自动进入滑行段。
-      # <=0 时整条通道退化为原纯 P 行为，作为回退开关。
+      # 转向 D 项增益，作用在 odom 实测角速度上（非误差差分，目标跳变不产生微分尖峰）：
+      # vtheta = Kp*err - damping*omega，omega 涨到 Kp*err/damping 时输出归零、进入滑行段。
+      # <=0 时退化为原纯 P 行为（回退开关）。
       yaw_track_damping: 0.20
       # odom yaw 差分得到的角速度低通截止频率（Hz）；步态引起抖动时降到 5，响应迟钝升到 12。
       yaw_rate_lpf_hz: 8.0
+      # 下发出口统一的斜率（加速度）限幅，替代各阶段各自打补丁；阶跃指令被摊成斜坡。
+      # 不消除方向反复（目标量在跳时来回仍在，只是变慢）；板端 rl_manager 另有 ≈2.5 m/s²
+      # 的平滑。0 = 关闭；三轴可独立调（横移最敏感，vy 给得最小）。
+      # 2026-11-17 整体提速 2×：加速斜率 2.5→3.5（0→2.2 约 0.63 s）。本体自身平滑约 2.5 m/s²，
+      # 该值只是“不成为瓶颈”，实际起步仍由本体决定；如果起步振满，先回退这一项。
+      accel_limit_vx: 3.5      # m/s²
+      accel_limit_vy: 1.8      # m/s²
+      accel_limit_vtheta: 10.0 # rad/s²
+      # 减速（刹车）单独限幅：|指令| 变小或换向时生效，加速仍走 accel_limit_*。
+      # 刹车只受摩擦/重心限制，可以比加速更阶；0 = 回退到对应的加速度值。
+      decel_limit_vx: 4.5      # m/s²
+      decel_limit_vy: 2.0      # m/s²
+      decel_limit_vtheta: 12.0 # rad/s²
+      # 距离-速度刹车模型参数（Brain::brakeSpeed）：v = −a·τ + √((a·τ)² + 2a·d)。
+      # 用于接球/绕后/包络等“按到目标的剩余距离限速”的场景，替代旧的 min(上限, 距离) 经验公式。
+      #   brake_decel   本体实际可达减速度（用于接球/到位/包络之外的距离封顶）
+      #   brake_latency 感知+决策+执行总滞后（深度 30ms + tick 10ms + 桥/步态 ~150ms）
+      # 2026-11-17：2.5 → 1.3。原值等于“刚好能停住”的零余量律（球距 2.0 m 就允许 2.13 m/s），
+      # 50 号机实测 2.37 m/s 峰值 + 0.9 s 位姿冻结 + 球位转记忆 → 必然撞球。取 1.3 后典型值：
+      # d=2.0→2.03、1.5→1.73、1.0→1.37、0.65→1.07、0.35→0.73、0.2→0.51 m/s（已含 0.26 的滞后项）。
+      # 注：speed_envelope_decel 仍为 2.5——包络另有静态余量（障碍 0.35 / 队友 0.70 / 边线 0.60），
+      # 两者语义不同，不要一起改；若要更保守先调这里的 brake_decel。
+      brake_decel: 1.3
+      brake_latency: 0.20
       cmd_log_interval_ms: 1000 # setVelocity 日志节流间隔(ms)：>0 节流，0 逐拍全量输出（专项排查），<0 关闭
       # 头部限位（rad）。pitch 是「相机光轴下俯角」，由 zl_io.head_pitch_offset_deg=-36
       # 换算成 head_pitch 关节角。新头部相机相对 head_pitch_link 固定下俯 36°、pitch 关节
@@ -158,7 +190,10 @@ brain_node:
       # 深度点云转到 base 系、以及 obstacle_min_height 的基准都依赖它。
       base_height_m: 0.83
       grid_size: 0.2
-      max_x: 3.0
+      # 2026-11-17 提速 2×：3.0 → 4.0。2.2 m/s 下 3 m 视野只剩 ≈1.4 s（含滞后），不够刹车；
+      # 4 m 处每格点数随距离平方下降，若 [obstacle] 的 maxconf 长期卡在 occupancy_threshold 附近，
+      # 再把 depth_sample_step 从 8 降到 6（点数×1.8，CPU 余量约 40%）。
+      max_x: 4.0
       max_y: 5.0
       exclusion_x: 0.4
       exclusion_y: 0.5
@@ -168,9 +203,10 @@ brain_node:
       # 3m 处约 4 点）。噪声大上调到 8，但不要超过 10，否则 3m 处全部漏检。
       # 注意它与球的 0-100 检测置信度不是同一量纲（球入库时会被抬到阈值之上）。
       occupancy_threshold: 5.0
-      # 射线走廊半宽：两机半径和约 0.4 m + 5 cm 余量。0.3 时会在 1.3 m 处漏判“擦身”
-      collision_threshold: 0.45
-      safe_distance: 2.0
+      # 射线走廊半宽：两机半径和约 0.4 m + 余量。2026-11-17 提速 2×：0.45 → 0.55
+      # （高速超调使实际轨迹外扩，侧向擦身需要更宽的判据）。
+      collision_threshold: 0.55
+      safe_distance: 3.0
       avoid_secs: 3.0
       enable_freekick_avoid: false
       freekick_start_placing_safe_distance: 0.1

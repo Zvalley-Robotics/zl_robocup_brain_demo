@@ -107,7 +107,8 @@ int RobotClient::waveHand(bool doWaveHand)
     return 0;
 }
 
-int RobotClient::setVelocity(double x, double y, double theta)
+int RobotClient::setVelocity(double x, double y, double theta, double vyLimitOverride,
+                           double accelVyOverride)
 {
     // 非有限速度按 0 处理后继续下发：既不把 null 送进链路，也避免沿用上一帧的危险速度。
     if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(theta))
@@ -130,10 +131,8 @@ int RobotClient::setVelocity(double x, double y, double theta)
     brain->log->debug("RobotClient/setVelocity_in",
                       format("vx: %.2f  vy: %.2f  vtheta: %.2f", rawX, rawY, rawTheta));
 
-    // 2026-11-05：3588 侧取消速度映射缩减后，本体按下发值 1:1 执行（旧版本实际约折半）。
-    // 缩放必须放在 min_v 抬升与限幅之前，使 min_vx/vy/vtheta 与 vx/vy/vtheta_limit 仍按
-    // “本体侧单位”解释：speed_scale=0.5 时 0.2 的意图值仍抬到 0.3（本体 0.15），与旧手感一致。
-    // 默认 1.0 = 保持新真实速度；小于 1.0 仅作快速回退开关。
+    // speed_scale：3588 侧取消速度映射缩减后本体按下发值 1:1 执行（旧版实际约折半）。
+    // 缩放必须放在 min_v 抬升与限幅之前，使各门限仍按“本体侧单位”解释；<1.0 仅作回退开关。
     double speedScale = brain->config->get_speed_scale();
     if (!std::isfinite(speedScale) || speedScale <= 0.0) speedScale = 1.0;
     if (speedScale != 1.0)
@@ -143,21 +142,72 @@ int RobotClient::setVelocity(double x, double y, double theta)
         theta *= speedScale;
     }
 
-    double minx = brain->config->get_min_vx();
-    double miny = brain->config->get_min_vy();
-    double mintheta = brain->config->get_min_vtheta();
-    if (fabs(x) < minx && fabs(x) > 1e-5)
-        x = x > 0 ? minx : -minx;
-    if (fabs(y) < miny && fabs(y) > 1e-5)
-        y = y > 0 ? miny : -miny;
+    // 低速指令抬升：本体判据是“合速度模 < 0.1 m/s 不响应”，不是逐轴 <0.1。按合模等比例
+    // 放大、方向不变；后退（vx<0）不放大——逐轴抬升会把可忽略的后退分量放大成持续倒退。
+    // vtheta 单位不同仍单独抬升；min_vx/min_vy 保留供行为树判断“某分量是否可表达”。
+    const double minLin = brain->config->get_min_lin_speed();
+    const double mintheta = brain->config->get_min_vtheta();
+    const double linMag = std::hypot(x, y);
+    if (minLin > 0.0 && linMag > 1e-5 && linMag < minLin && x >= 0.0)
+    {
+        const double scale = minLin / linMag; // 保持方向，只放大模长
+        x *= scale;
+        y *= scale;
+    }
     if (fabs(theta) < mintheta && fabs(theta) > 1e-5)
         theta = theta > 0 ? mintheta : -mintheta;
     x = cap(x, brain->config->get_vx_limit(), -brain->config->get_vx_limit());
-    y = cap(y, brain->config->get_vy_limit(), -brain->config->get_vy_limit());
+    // y 轴上限：默认走 config 的 robot.vy_limit（前锋/Assist 共享）。门将站位是唯一需要
+    // 更宽横移的场景（射门时需 0.6~1.0 m/s 才能封住两柱），由调用方显式传 override，
+    // 且仍夹一道硬上限，避免 XML 写错让本体失稳；override<=全局值时等于不生效。
+    constexpr double kCmdVyHardMax = 0.80;
+    double vyCap = brain->config->get_vy_limit();
+    if (vyLimitOverride > 0.0 && vyLimitOverride > vyCap)
+        vyCap = vyLimitOverride < kCmdVyHardMax ? vyLimitOverride : kCmdVyHardMax;
+    y = cap(y, vyCap, -vyCap);
     theta = cap(theta, brain->config->get_vtheta_limit(), -brain->config->get_vtheta_limit());
 
+    // 后退单独上限：vx_limit 正负对称，各节点都能要求 1.0 m/s 退避，而双足后退重心不稳。
+    // 在出口统一夹一道（夹在对称 cap 之后、加速度限幅之前）；<=0 或 >= vx_limit 等于关闭。
+    {
+        const double vxBackward = brain->config->get_vx_limit_backward();
+        if (vxBackward > 0.0 && x < -vxBackward) x = -vxBackward;
+    }
+
+    // 加速度（斜率）限幅：各阶段各自打补丁太分散，改在下发出口统一限幅，所有节点自动受益，
+    // 阶跃指令被摊成 0.4~0.8 s 斜坡。它不消除“方向反复”本身；板端 rl_manager 另有 ≈2.5 m/s²
+    // 平滑，本层须更小才有增量意义。0 或负值关闭，三轴可独立回退。
+    const double accelVx = brain->config->get_accel_limit_vx();
+    // 门将专项：全局 1.2 m/s² 从 0 到 0.6 要 0.5 s，在 1 s 级扑救窗口里占一半时间，
+    // 因此允许调用方把 y 轴斜率提到本体自身平滑值（≈2.5 m/s²），不改全局值。
+    const double accelVy = (accelVyOverride > 0.0) ? accelVyOverride : brain->config->get_accel_limit_vy();
+    const double accelVtheta = brain->config->get_accel_limit_vtheta();
+    // 刹车（|指令| 变小或换向）走 decel_limit_*：加速受步态稳定限制，刹车只受摩擦/重心
+    // 限制，二者共用一个值会让高速档刹不住（2.2 m/s 按 3.5 减速需 0.63 s / 0.7 m）。
+    // <=0 回退到对应加速度值；且刹车永不低于加速度（否则等于没有刹车增益）。
+    const double decelVx = max(brain->config->get_decel_limit_vx(), accelVx);
+    const double decelVy = max(brain->config->get_decel_limit_vy(), accelVy);
+    const double decelVtheta = max(brain->config->get_decel_limit_vtheta(), accelVtheta);
+    const auto nowCmd = brain->get_clock()->now();
+    const double dtCmd = (_lastCmdTime.nanoseconds() > 0)
+                             ? (nowCmd - _lastCmdTime).seconds()
+                             : -1.0;
+    // 单向斜率限幅：制动（绝对值变小或换向）用 down，其余用 up。
+    auto slew = [](double target, double current, double up, double down, double dt) {
+        const bool braking = fabs(target) < fabs(current) || target * current < 0.0;
+        const double rate = braking ? down : up;
+        if (rate <= 0.0) return target; // 未配置 = 不限速
+        return cap(target, current + rate * dt, current - rate * dt);
+    };
+    // dt 异常（首拍 / tick 抖动 / 断流）时不限速，直接对齐，避免卡住
+    if (dtCmd > 1e-3 && dtCmd < 0.2)
+    {
+        x = slew(x, _vx, accelVx, decelVx, dtCmd);
+        y = slew(y, _vy, accelVy, decelVy, dtCmd);
+        theta = slew(theta, _vtheta, accelVtheta, decelVtheta, dtCmd);
+    }
     _vx = x; _vy = y; _vtheta = theta; // remember last command. Can be approximately used as the current robot's velocity.
-    _lastCmdTime = brain->get_clock()->now();
+    _lastCmdTime = nowCmd;
     if (fabs(_vx) > 1e-3 || fabs(_vy) > 1e-3 || fabs(_vtheta) > 1e-3) _lastNonZeroCmdTime = brain->get_clock()->now();
 
     // 行为树每拍都会下发一次速度，逐拍打 INFO 会刷屏并拖快日志轮转。
@@ -220,6 +270,41 @@ bool RobotClient::isStandingStill(double timeBuffer) {
     return fabs(_vx) < 1e-3 && fabs(_vy) < 1e-3 && fabs(_vtheta) < 1e-3 && brain->msecsSince(_lastNonZeroCmdTime) > timeBuffer;
 }
 
+void RobotClient::checkStuck() {
+    constexpr double CMD_MIN = 0.30;  // 指令合速度门限（避开 min_lin_speed 抬升的 0.12）
+    constexpr double MOVE_MIN = 0.05; // 窗口内应有位移速度，低于此值算“没走”
+    constexpr double WIN_SEC = 1.0;
+
+    static rclcpp::Time winStart = brain->get_clock()->now();
+    static Pose2D winPose = brain->data->robotPoseToField;
+    static double stuckMs = 0.0;
+    static rclcpp::Time lastLog = brain->get_clock()->now();
+
+    const auto now = brain->get_clock()->now();
+    const double dt = (now - winStart).seconds();
+    // 窗口未满或时间跳变过长时重开窗口
+    if (dt < WIN_SEC || dt > 5.0) {
+        winStart = now;
+        winPose = brain->data->robotPoseToField;
+        return;
+    }
+
+    const auto p = brain->data->robotPoseToField;
+    const double rate = norm(p.x - winPose.x, p.y - winPose.y) / dt;
+    const double cmd = std::hypot(_vx, _vy);
+    winStart = now;
+    winPose = p;
+
+    if (cmd >= CMD_MIN && rate < MOVE_MIN) stuckMs += dt * 1000.0;
+    else stuckMs = 0.0;
+
+    if (stuckMs >= 1000.0 && brain->msecsSince(lastLog) > 1000) {
+        lastLog = now;
+        RCLCPP_WARN(brain->get_logger(), "[stuck] cmd=%.2f m/s 实测 %.3f m/s 持续 %.1f s，机体未跟上指令（接触/被顶住/打滑）",
+                    cmd, rate, stuckMs / 1000.0);
+    }
+}
+
 int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double longRangeThreshold, double turnThreshold, double vxLimit, double vyLimit, double vthetaLimit, double xTolerance, double yTolerance, double thetaTolerance, bool avoidObstacle) {
     static string mode = "longRange";
     static bool isBacking = false;
@@ -247,7 +332,9 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
             vy = 0.0;
             vtheta = tarDir_r;
         } else {
-            vx = cap(range, vxLimit, -vxLimit);
+            // 长距段：用刹车模型按剩余距离限速（旧式 cap(range) 是 1 m/s per meter，
+            // 1.4 m/s 档位会在目标点前冲过去）
+            vx = min(vxLimit, brain->brakeSpeed(max(0.0, range - xTolerance)));
             vy = 0.0;
             vtheta = tarDir_r;
         }
@@ -277,7 +364,11 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
                 }
             } else {
                 double distToObstacle = brain->distToObstacle(tarDir_r);
-                if (distToObstacle < SAFE_DIST * 2) vxLimit = 0.5;
+                // 旧式“障碍进入 2×SAFE_DIST 就一律降到 0.5”在 safe_distance 抬到 3.0 后
+                // 等于 6 m 内全部半速；改为按清距的刹车模型降速（仍保留 0.5 的硬下限）。
+                if (distToObstacle < SAFE_DIST * 2) {
+                    vxLimit = min(vxLimit, max(0.5, brain->brakeSpeed(distToObstacle - 0.35)));
+                }
                 if (distToObstacle < SAFE_DIST) {
                     timeEndAvoid = now + rclcpp::Duration(AVOID_SECS, 0.0);
                     avoidDir = brain->calcAvoidDir(tarDir_r, SAFE_DIST) > 0 ? 1.0 : -1.0;
@@ -293,6 +384,16 @@ int RobotClient::moveToPoseOnField2(double tx, double ty, double ttheta, double 
 
         vx = range * cos(tarDir_r);
         vy = range * sin(tarDir_r);
+        // 短距段同样是 1 m/s per meter，用刹车模型封顶，避免近距冲过站位点
+        {
+            const double speedCap = min(vxLimit, brain->brakeSpeed(range));
+            const double mag = norm(vx, vy);
+            if (mag > speedCap && mag > 1e-6) {
+                const double s = speedCap / mag;
+                vx *= s;
+                vy *= s;
+            }
+        }
         vtheta = toPInPI(ttheta - faceDir);
         if (fabs(vx) < xTolerance && fabs(vy) < yTolerance && fabs(vtheta) < thetaTolerance) {
             vx = 0.0;
@@ -343,7 +444,9 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
             vy = 0.0;
             vtheta = tarDir_r;
         } else {
-            vx = cap(range, vxLimit, -vxLimit);
+            // 长距段：用刹车模型按剩余距离限速（旧式 cap(range) 是 1 m/s per meter，
+            // 1.4 m/s 档位会在目标点前冲过去）
+            vx = min(vxLimit, brain->brakeSpeed(max(0.0, range - xTolerance)));
             vy = 0.0;
             vtheta = tarDir_r;
         }
@@ -398,6 +501,16 @@ int RobotClient::moveToPoseOnField3(double tx, double ty, double ttheta, double 
 
         vx = range * cos(tarDir_r);
         vy = range * sin(tarDir_r);
+        // 短距段同样是 1 m/s per meter，用刹车模型封顶，避免近距冲过站位点
+        {
+            const double speedCap = min(vxLimit, brain->brakeSpeed(range));
+            const double mag = norm(vx, vy);
+            if (mag > speedCap && mag > 1e-6) {
+                const double s = speedCap / mag;
+                vx *= s;
+                vy *= s;
+            }
+        }
         vtheta = toPInPI(ttheta - faceDir);
         if (fabs(vx) < xTolerance && fabs(vy) < yTolerance && fabs(vtheta) < thetaTolerance) {
             vx = 0.0;
